@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en" class="dark">
+  <head>
+    <meta charset="UTF-8" />
+    <script>
+      // No-flash theme bootstrap: apply stored theme before first paint. Dark by default.
+      (function () {
+        try {
+          var t = localStorage.getItem("sv_theme") || "dark";
+          var h = document.documentElement;
+          h.classList.remove("dark", "light");
+          h.classList.add(t === "light" ? "light" : "dark");
+        } catch (e) {}
+      })();
+    </script>
+    <link rel="icon" type="image/x-icon" href="/favicon.ico" />
+    <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32.png" />
+    <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="theme-color" content="#070c1a" />
+    <title>Bizzrow — Business management as simple as WhatsApp</title>
+    <meta name="description" content="Bizzrow is a business operating system for retailers, wholesalers and distributors. Manage inventory, sales, customer ledger, outstanding payments, business insights and WhatsApp communication from one simple platform." />
+    <meta name="keywords" content="business management software, inventory management software, retail management software, wholesale business software, ledger software, inventory tracking, customer due management" />
+    <link rel="canonical" href="https://bizzrow.com/" />
+    <meta property="og:type" content="website" />
+    <meta property="og:site_name" content="Bizzrow" />
+    <meta property="og:title" content="Bizzrow — Business management as simple as WhatsApp" />
+    <meta property="og:description" content="Manage inventory, sales, customer dues and business operations from one simple platform built for retailers and wholesalers." />
+    <meta property="og:url" content="https://bizzrow.com/" />
+    <meta property="og:image" content="https://bizzrow.com/marketing/og-image.png" />
+    <meta property="og:image:width" content="1200" />
+    <meta property="og:image:height" content="630" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content="Bizzrow — Business management as simple as WhatsApp" />
+    <meta name="twitter:description" content="A business operating system for retailers, wholesalers and distributors." />
+    <meta name="twitter:image" content="https://bizzrow.com/marketing/og-image.png" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=Plus+Jakarta+Sans:wght@600;700;800&display=swap" rel="stylesheet" />
+    <script type="application/ld+json">
+      {
+        "@context": "https://schema.org",
+        "@type": "SoftwareApplication",
+        "name": "Bizzrow",
+        "applicationCategory": "BusinessApplication",
+        "operatingSystem": "Web, Android, iOS, Windows, macOS",
+        "description": "Business operating system for retailers, wholesalers and distributors — inventory, sales, customer ledger, outstanding payments, business insights and WhatsApp communication.",
+        "offers": { "@type": "Offer", "price": "0", "priceCurrency": "INR" },
+        "url": "https://bizzrow.com/"
+      }
+    </script>
+  </head>
+  <body class="antialiased">
+    <div id="root"></div>
+    <script type="module" src="/src/main.jsx"></script>
+  </body>
+</html>
