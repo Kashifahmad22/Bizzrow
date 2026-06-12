@@ -1,4 +1,5 @@
 import { Routes, Route, Navigate } from "react-router-dom";
+import { Analytics } from "@vercel/analytics/react";
 import { useAuth } from "./context/AuthContext.jsx";
 import AppShell from "./components/AppShell.jsx";
 
@@ -39,41 +40,44 @@ function PublicOnly({ children }) {
 
 export default function App() {
   return (
-    <Routes>
-      {/* Public marketing site */}
-      <Route path="/" element={<Landing />} />
-      <Route path="/privacy" element={<Privacy />} />
-      <Route path="/terms" element={<Terms />} />
+    <>
+      <Routes>
+        {/* Public marketing site */}
+        <Route path="/" element={<Landing />} />
+        <Route path="/privacy" element={<Privacy />} />
+        <Route path="/terms" element={<Terms />} />
 
-      {/* Auth */}
-      <Route path="/login" element={<PublicOnly><Login /></PublicOnly>} />
-      <Route path="/signup" element={<PublicOnly><Register /></PublicOnly>} />
-      {/* Backward compatibility: old /register links */}
-      <Route path="/register" element={<Navigate to="/signup" replace />} />
-      <Route path="/forgot-password" element={<PublicOnly><ForgotPassword /></PublicOnly>} />
-      <Route path="/reset-password" element={<ResetPassword />} />
+        {/* Auth */}
+        <Route path="/login" element={<PublicOnly><Login /></PublicOnly>} />
+        <Route path="/signup" element={<PublicOnly><Register /></PublicOnly>} />
+        {/* Backward compatibility: old /register links */}
+        <Route path="/register" element={<Navigate to="/signup" replace />} />
+        <Route path="/forgot-password" element={<PublicOnly><ForgotPassword /></PublicOnly>} />
+        <Route path="/reset-password" element={<ResetPassword />} />
 
-      {/* Authenticated application — now under /app */}
-      <Route
-        path="/app"
-        element={
-          <Protected>
-            <AppShell />
-          </Protected>
-        }
-      >
-        <Route index element={<Dashboard />} />
-        <Route path="products" element={<Products />} />
-        <Route path="ledger" element={<Ledger />} />
-        <Route path="sales" element={<Sales />} />
-        <Route path="ai" element={<AIInsights />} />
-        <Route path="whatsapp" element={<WhatsAppPage />} />
-        <Route path="settings" element={<Settings />} />
-        <Route path="*" element={<Navigate to="/app" replace />} />
-      </Route>
+        {/* Authenticated application — now under /app */}
+        <Route
+          path="/app"
+          element={
+            <Protected>
+              <AppShell />
+            </Protected>
+          }
+        >
+          <Route index element={<Dashboard />} />
+          <Route path="products" element={<Products />} />
+          <Route path="ledger" element={<Ledger />} />
+          <Route path="sales" element={<Sales />} />
+          <Route path="ai" element={<AIInsights />} />
+          <Route path="whatsapp" element={<WhatsAppPage />} />
+          <Route path="settings" element={<Settings />} />
+          <Route path="*" element={<Navigate to="/app" replace />} />
+        </Route>
 
-      {/* Anything else → marketing home */}
-      <Route path="*" element={<Navigate to="/" replace />} />
-    </Routes>
+        {/* Anything else → marketing home */}
+        <Route path="*" element={<Navigate to="/" replace />} />
+      </Routes>
+      <Analytics />
+    </>
   );
 }
