@@ -62,18 +62,18 @@ router.post(
 router.post(
   "/login",
   asyncHandler(async (req, res) => {
-    const { email, password } = req.body;
-    if (!email || !password) {
-      res.status(400);
-      throw new Error("email and password are required");
-    }
-    const user = await User.findOne({ email: email.toLowerCase() });
-    if (!user || !(await user.matchPassword(password))) {
-      res.status(401);
-      throw new Error("Invalid credentials");
-    }
-    res.json({ token: signToken(user._id), user: publicUser(user) });
-  })
+  const { email, password } = req.body;
+  if (!email || !password) {
+    res.status(400);
+    throw new Error("email and password are required");
+  }
+  const user = await User.findOne({ email: email.toLowerCase() });
+  if (!user || !(await user.matchPassword(password))) {
+    res.status(401);
+    throw new Error("Invalid credentials");
+  }
+  res.json({ token: signToken(user._id), user: publicUser(user) });
+})
 );
 
 // GET /api/auth/me
