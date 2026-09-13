@@ -1,0 +1,7 @@
+{
+  "name": "bizzrow",
+  "private": true,
+  "scripts": {
+    "build": "npm --prefix client run build"
+  }
+}
