@@ -24,6 +24,98 @@ function discountAmountFor(base, type, value) {
   return round2(Math.min(v, base)); // flat amount, never more than the base
 }
 
+function allocateCents(total, weights) {
+  const totalCents = Math.max(0, Math.round(Number(total || 0) * 100));
+  const cents = weights.map((weight) => Math.max(0, Math.round(Number(weight || 0) * 100)));
+  const weightTotal = cents.reduce((sum, value) => sum + value, 0);
+  if (!totalCents || !weightTotal) return cents.map(() => 0);
+
+  const exact = cents.map((value) => (totalCents * value) / weightTotal);
+  const allocated = exact.map(Math.floor);
+  let remainder = totalCents - allocated.reduce((sum, value) => sum + value, 0);
+  const order = exact
+    .map((value, index) => ({ index, fraction: value - allocated[index] }))
+    .sort((a, b) => b.fraction - a.fraction || a.index - b.index);
+  for (let i = 0; i < remainder; i += 1) allocated[order[i].index] += 1;
+  return allocated;
+}
+
+function allocateReturnItems(sale, requestedItems) {
+  const items = sale.items || [];
+  const itemWeights = items.map((item) => {
+    if (item.subtotal != null) return Number(item.subtotal) || 0;
+    return (Number(item.unitPrice) || 0) * (Number(item.quantity) || 0);
+  });
+  const lineCents = allocateCents(sale.total, itemWeights);
+  const remainingByProduct = new Map();
+  for (const item of items) {
+    const id = String(item.product);
+    const available = Math.max(0, Number(item.quantity || 0) - Number(item.returnedQty || 0));
+    remainingByProduct.set(id, (remainingByProduct.get(id) || 0) + available);
+  }
+
+  const requestedByProduct = new Map();
+  for (const request of requestedItems || []) {
+    const quantity = Number(request.quantity);
+    if (!Number.isInteger(quantity) || quantity <= 0) {
+      throw new Error("Return quantities must be positive whole numbers");
+    }
+    const id = String(request.productId);
+    requestedByProduct.set(id, (requestedByProduct.get(id) || 0) + quantity);
+  }
+
+  for (const [id, quantity] of requestedByProduct) {
+    if (!remainingByProduct.has(id)) throw new Error("Returned item is not part of this sale");
+    if (quantity > remainingByProduct.get(id)) {
+      throw new Error(`Cannot return ${quantity} — only ${remainingByProduct.get(id)} returnable`);
+    }
+  }
+
+  const result = [];
+  for (const [id, requested] of requestedByProduct) {
+    let remaining = requested;
+    for (const [index, item] of items.entries()) {
+      if (String(item.product) !== id || remaining === 0) continue;
+      const oldReturned = Number(item.returnedQty) || 0;
+      const available = Math.max(0, Number(item.quantity || 0) - oldReturned);
+      const quantity = Math.min(available, remaining);
+      if (quantity === 0) continue;
+      const totalLineCents = lineCents[index];
+      const beforeCents = Math.round((totalLineCents * oldReturned) / item.quantity);
+      const afterCents = Math.round((totalLineCents * (oldReturned + quantity)) / item.quantity);
+      result.push({
+        item,
+        quantity,
+        refund: (afterCents - beforeCents) / 100,
+        newReturnedQty: oldReturned + quantity,
+      });
+      remaining -= quantity;
+    }
+  }
+
+  return result;
+}
+
+function normalizePaymentSplits(payments, maximum) {
+  if (!Array.isArray(payments)) throw new Error("Payments must be an array");
+  const normalized = [];
+  for (const payment of payments) {
+    if (!payment || !["cash", "upi", "bank", "card"].includes(payment.method)) {
+      throw new Error("Payment method must be cash, upi, bank, or card");
+    }
+    const rawAmount = Number(payment.amount);
+    if (!Number.isFinite(rawAmount) || rawAmount <= 0) {
+      throw new Error("Each payment amount must be a positive number");
+    }
+    const amount = round2(rawAmount);
+    if (amount <= 0) throw new Error("Each payment amount must be at least 0.01");
+    normalized.push({ method: payment.method, amount });
+  }
+  const total = round2(normalized.reduce((sum, payment) => sum + payment.amount, 0));
+  if (total > round2(maximum)) throw new Error("Payments cannot exceed the amount due");
+  return normalized;
+}
+
 /**
  * computeSaleTotals({ items, billDiscount })
  *  items: [{ unitPrice, quantity, discountType?, discountValue? , ...snapshot }]
@@ -72,33 +164,104 @@ function computeSaleTotals({ items = [], billDiscount = {} } = {}) {
 /**
  * computeReturnSettlement(sale, refund) — pure money math for a return/replacement leg.
  *
- * On returning goods worth `refund`:
- *   dueReduction = min(refund, dueAmount)   // cancels what was still owed
- *   cashRefund   = refund - dueReduction    // already-paid portion goes back as cash
- * Reduces payments[] (greedy) + amountPaid by cashRefund so "collected" drops.
- * Invariant after applying: total - returnedAmount === amountPaid + dueAmount.
+ * The outstanding part is cancelled first, followed by actual tender and then
+ * replacement credit. The compatibility cashRefund result is the post-due value;
+ * paidRefund and creditRefund separate its two accounting sources.
+ * Invariant after applying: total - returnedAmount === amountPaid + creditApplied + dueAmount.
  */
 function computeReturnSettlement(sale, refund) {
   const r = round2(refund);
+  const remaining = round2((sale.total || 0) - (sale.returnedAmount || 0));
+  if (!Number.isFinite(r) || r < 0 || r > remaining) {
+    throw new Error("Return amount exceeds the remaining sale value");
+  }
   const dueReduction = round2(Math.min(r, Math.max(0, sale.dueAmount || 0)));
-  const cashRefund = round2(r - dueReduction);
+  const afterDue = round2(r - dueReduction);
+  const paymentSplits = sale.payments || [];
+  const legacyCredit = round2((paymentSplits
+    .filter((payment) => payment.method === "credit")
+    .reduce((sum, payment) => sum + (Number(payment.amount) || 0), 0)
+    || (paymentSplits.length === 0 && sale.paymentMethod === "credit" ? Number(sale.amountPaid) || 0 : 0)));
+  const creditApplied = round2(Math.max(Number(sale.creditApplied) || 0, legacyCredit));
+  const rawActualPayments = paymentSplits.length
+    ? paymentSplits.filter((payment) => payment.method !== "credit")
+    : (Number(sale.amountPaid) || 0) > legacyCredit
+      ? [{
+        method: ["cash", "upi", "bank", "card"].includes(sale.paymentMethod) ? sale.paymentMethod : "cash",
+        amount: round2((Number(sale.amountPaid) || 0) - legacyCredit),
+      }]
+      : [];
+  const actualPaymentTotal = round2(rawActualPayments.reduce((sum, payment) => sum + (Number(payment.amount) || 0), 0));
+  const amountPaid = round2(Math.min(
+    Math.max(0, (Number(sale.amountPaid) || 0) - legacyCredit),
+    actualPaymentTotal
+  ));
+  const reconciledDue = round2(remaining - amountPaid - creditApplied);
+  if (Math.abs(reconciledDue - round2(sale.dueAmount || 0)) > 0.001) {
+    throw new Error("Sale's paid, credited, and due amounts are inconsistent");
+  }
+  let tenderToRetain = amountPaid;
+  const actualPayments = [];
+  for (const payment of rawActualPayments) {
+    if (tenderToRetain <= 0) break;
+    const amount = round2(Math.min(Number(payment.amount) || 0, tenderToRetain));
+    if (amount > 0) {
+      actualPayments.push({
+        method: payment.method,
+        amount,
+        source: payment.source || "sale",
+        ...(payment.collectedAt ? { collectedAt: payment.collectedAt } : {}),
+      });
+    }
+    tenderToRetain = round2(tenderToRetain - amount);
+  }
+  const paidRefund = round2(Math.min(afterDue, amountPaid));
+  const creditRefund = round2(afterDue - paidRefund);
+  if (creditRefund > creditApplied) {
+    throw new Error("Return amount exceeds the sale's paid and credited balance");
+  }
   const newReturnedAmount = round2((sale.returnedAmount || 0) + r);
 
-  const newPayments = (sale.payments || []).map((p) => ({ method: p.method, amount: p.amount }));
-  let remaining = cashRefund;
+  const newPayments = actualPayments.map((payment) => ({ ...payment }));
+  const paidRefundPayments = [];
+  let remainingCashRefund = paidRefund;
   for (const p of newPayments) {
-    if (remaining <= 0) break;
-    const take = Math.min(p.amount, remaining);
+    if (remainingCashRefund <= 0) break;
+    const take = Math.min(p.amount, remainingCashRefund);
     p.amount = round2(p.amount - take);
-    remaining = round2(remaining - take);
+    remainingCashRefund = round2(remainingCashRefund - take);
+    if (take > 0) {
+      paidRefundPayments.push({
+        method: p.method,
+        amount: round2(take),
+        source: p.source || "sale",
+      });
+    }
   }
   const trimmedPayments = newPayments.filter((p) => p.amount > 0);
 
-  const newAmountPaid = round2(Math.max(0, (sale.amountPaid || 0) - cashRefund));
-  const newDueAmount = round2(Math.max(0, (sale.total || 0) - newReturnedAmount - newAmountPaid));
-  const paymentStatus = newDueAmount === 0 ? (newAmountPaid > 0 ? "paid" : "unpaid") : newAmountPaid > 0 ? "partial" : "unpaid";
+  const newAmountPaid = round2(Math.max(0, amountPaid - paidRefund));
+  const newCreditApplied = round2(Math.max(0, creditApplied - creditRefund));
+  const calculatedDue = round2((sale.total || 0) - newReturnedAmount - newAmountPaid - newCreditApplied);
+  if (calculatedDue < 0) throw new Error("Return would overpay the remaining sale value");
+  const newDueAmount = calculatedDue;
+  const paymentStatus = newDueAmount === 0
+    ? "paid"
+    : newAmountPaid + newCreditApplied > 0 ? "partial" : "unpaid";
 
-  return { dueReduction, cashRefund, newReturnedAmount, newPayments: trimmedPayments, newAmountPaid, newDueAmount, paymentStatus };
+  return {
+    dueReduction,
+    cashRefund: afterDue,
+    paidRefund,
+    creditRefund,
+    paidRefundPayments,
+    newReturnedAmount,
+    newPayments: trimmedPayments,
+    newAmountPaid,
+    newCreditApplied,
+    newDueAmount,
+    paymentStatus,
+  };
 }
 
 /**
@@ -121,9 +284,19 @@ function computeReplacementCredit({ cashRefund = 0, replacementTotal = 0, extraP
   const refund = round2(Math.max(0, cashRefund));
   const repl = round2(Math.max(0, replacementTotal));
   const extra = round2(Math.max(0, extraPaid));
-  const carriedCredit = round2(Math.min(refund, Math.max(0, repl - extra)));
+  if (extra > repl) throw new Error("Payments cannot exceed the replacement total");
+  const carriedCredit = round2(Math.min(refund, repl - extra));
   const cashReturned = round2(refund - carriedCredit);
   return { carriedCredit, cashReturned };
 }
 
-module.exports = { computeSaleTotals, discountAmountFor, computeReturnSettlement, computeReplacementCredit, round2 };
+module.exports = {
+  computeSaleTotals,
+  discountAmountFor,
+  allocateCents,
+  allocateReturnItems,
+  normalizePaymentSplits,
+  computeReturnSettlement,
+  computeReplacementCredit,
+  round2,
+};

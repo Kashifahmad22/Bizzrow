@@ -4,6 +4,7 @@ const asyncHandler = require("../utils/asyncHandler");
 const { protect } = require("../middleware/auth");
 const { buildTextFilter } = require("../utils/search");
 const { clampLimit, clampPage, pageMeta } = require("../utils/validate");
+const { round2 } = require("../utils/saleMath");
 
 const router = express.Router();
 router.use(protect);
@@ -30,7 +31,7 @@ router.get(
     res.json({
       customers,
       ...pageMeta(total, page, limit),
-      summary: { totalCustomers: s.count, totalPending: Math.round(s.totalPending), owing: s.owing },
+      summary: { totalCustomers: s.count, totalPending: round2(s.totalPending), owing: s.owing },
     });
   })
 );
@@ -39,7 +40,7 @@ router.get(
 router.post(
   "/",
   asyncHandler(async (req, res) => {
-    const { name, phone, shopName, address, notes } = req.body;
+    const { name, phone, shopName, address, gstNumber, notes } = req.body;
     if (!name || !phone) {
       res.status(400);
       throw new Error("name and phone are required");
@@ -51,6 +52,7 @@ router.post(
         phone,
         shopName,
         address,
+        gstNumber,
         notes,
       });
       res.status(201).json({ customer });
@@ -73,7 +75,7 @@ router.put(
       res.status(404);
       throw new Error("Customer not found");
     }
-    const fields = ["name", "phone", "shopName", "address", "notes"];
+    const fields = ["name", "phone", "shopName", "address", "gstNumber", "notes"];
     for (const f of fields) if (f in req.body) customer[f] = req.body[f];
     await customer.save();
     res.json({ customer });

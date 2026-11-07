@@ -16,6 +16,16 @@ const userSchema = new mongoose.Schema(
       upiId: { type: String, default: "" }, // e.g. shop@okhdfcbank
       upiQr: { type: String, default: "" }, // base64 data URL
       currency: { type: String, default: "INR" },
+      invoiceReturnPeriodDays: { type: Number, min: 0, max: 365, default: 7 },
+      invoiceTerms: {
+        type: [String],
+        default: [
+          "Return or exchange requests may be considered within {returnPeriodDays} days of the invoice date, subject to the policy communicated at purchase and applicable law.",
+          "Please report any damage or shortage promptly for review.",
+          "Goods showing signs of use, washing, alteration, or customer-caused damage may not be eligible for return or exchange, subject to applicable law.",
+          "Wholesale and retail goods are governed by the return and exchange policy communicated at purchase and applicable law.",
+        ],
+      },
     },
     preferences: {
       whatsappAutoInvoice: { type: Boolean, default: true },
@@ -23,6 +33,7 @@ const userSchema = new mongoose.Schema(
       lowStockThreshold: { type: Number, default: 5 },
       theme: { type: String, enum: ["dark", "light"], default: "dark" },
     },
+    tokenVersion: { type: Number, default: 0 },
     // Password reset (Sprint 1) — store only the SHA-256 hash of the token.
     resetTokenHash: { type: String, default: "" },
     resetTokenExpiresAt: { type: Date },

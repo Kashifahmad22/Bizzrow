@@ -4,8 +4,18 @@ const saleItemSchema = new mongoose.Schema(
   {
     product: { type: mongoose.Schema.Types.ObjectId, ref: "Product", required: true },
     name: { type: String, required: true }, // snapshot at time of sale
+    sku: { type: String, default: "" },
+    unit: { type: String, default: "" },
     size: String,
     color: String,
+    wholesalePrice: { type: Number, min: 0 },
+    retailPrice: { type: Number, min: 0 },
+    batchAllocations: [{
+      batch: { type: mongoose.Schema.Types.ObjectId, ref: "StockBatch", required: true },
+      quantity: { type: Number, required: true, min: 0.000001 },
+      costPrice: { type: Number, default: null, min: 0 },
+    }],
+    legacyQuantityFirst: { type: Number, default: 0, min: 0 },
     quantity: { type: Number, required: true, min: 1 },
     unitPrice: { type: Number, required: true, min: 0 },
     // Item-level discount (Master Sprint). Backward compatible: defaults to none.
@@ -25,6 +35,8 @@ const paymentSplitSchema = new mongoose.Schema(
   {
     method: { type: String, enum: ["cash", "upi", "bank", "card", "credit"], required: true },
     amount: { type: Number, required: true, min: 0 },
+    source: { type: String, enum: ["sale", "ledger"], default: "sale" },
+    collectedAt: { type: Date },
   },
   { _id: false }
 );
@@ -35,11 +47,16 @@ const saleSchema = new mongoose.Schema(
     // Optional: walk-in customers have no Customer document and no ledger.
     customer: { type: mongoose.Schema.Types.ObjectId, ref: "Customer", index: true, default: null },
     customerName: { type: String, required: true }, // snapshot ("Walk-in Customer" for walk-ins)
+    customerPhoneSnapshot: { type: String, default: "" },
+    customerShopNameSnapshot: { type: String, default: "" },
+    customerAddressSnapshot: { type: String, default: "" },
+    customerGstNumberSnapshot: { type: String, default: "" },
     customerType: {
       type: String,
       enum: ["existing", "new", "walkin"],
       default: "existing",
     },
+    saleType: { type: String, enum: ["wholesale", "retail"], default: "wholesale" },
     items: { type: [saleItemSchema], default: [] },
     // Discount rollups (Master Sprint). For legacy sales these default to 0 and
     // subtotal is treated as equal to total on read.
@@ -53,8 +70,14 @@ const saleSchema = new mongoose.Schema(
     // Returns v1 (additive). returnedAmount reduces realized revenue + profit.
     returnedAmount: { type: Number, default: 0, min: 0 },
     returnStatus: { type: String, enum: ["none", "partial", "full"], default: "none" },
-    // Split payments are the source of truth; amountPaid = sum of payments[].amount
+    creditApplied: { type: Number, default: 0, min: 0 },
+    creditSources: [{
+      sale: { type: mongoose.Schema.Types.ObjectId, ref: "Sale", required: true },
+      amount: { type: Number, required: true, min: 0 },
+    }],
+    // Payment splits record actual tender; credit is tracked separately.
     payments: { type: [paymentSplitSchema], default: [] },
+    collectionPayments: { type: [paymentSplitSchema], default: undefined, immutable: true },
     amountPaid: { type: Number, default: 0, min: 0 },
     dueAmount: { type: Number, default: 0, min: 0 },
     // Summary method: a single method, or "split" when more than one was used.
@@ -69,6 +92,8 @@ const saleSchema = new mongoose.Schema(
       default: "paid",
     },
     invoiceNumber: { type: String, index: true },
+    invoiceTermsSnapshot: { type: [String], default: [] },
+    invoiceReturnPeriodDaysSnapshot: { type: Number, default: null, min: 0, max: 365 },
     notes: { type: String, default: "" },
     // Replacement linkage (Final RC): set on the new sale created by a replacement.
     replacementOf: { type: mongoose.Schema.Types.ObjectId, ref: "Sale", default: null },

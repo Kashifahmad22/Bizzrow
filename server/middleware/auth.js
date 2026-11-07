@@ -1,5 +1,6 @@
 const jwt = require("jsonwebtoken");
 const User = require("../models/User");
+const { tokenVersionMatches } = require("../utils/tokenVersion");
 
 async function protect(req, res, next) {
   try {
@@ -14,6 +15,10 @@ async function protect(req, res, next) {
     if (!user) {
       res.status(401);
       throw new Error("Not authorized — user no longer exists");
+    }
+    if (!tokenVersionMatches(decoded.tokenVersion, user.tokenVersion)) {
+      res.status(401);
+      throw new Error("Not authorized — session has been revoked");
     }
     req.user = user;
     next();

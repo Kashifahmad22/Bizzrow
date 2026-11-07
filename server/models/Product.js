@@ -8,13 +8,16 @@ const productSchema = new mongoose.Schema(
     color: { type: String, default: "" },
     size: { type: String, default: "" }, // e.g. "M", "L", "XL"
     sku: { type: String, default: "" },
+    barcode: { type: String, default: "", trim: true },
     // Unified product creation (Master Sprint) — all additive / optional.
     brand: { type: String, default: "" },
     unit: { type: String, default: "pcs" }, // pcs, box, kg, mtr…
     gstPct: { type: Number, default: 0, min: 0 }, // captured at product level only (no sale GST)
     hsn: { type: String, default: "" },
     marginPct: { type: Number, default: 0 }, // cost + marginPct => sellingPrice
-    costPrice: { type: Number, required: true, min: 0 },
+    costPrice: { type: Number, default: null, min: 0 },
+    wholesalePrice: { type: Number, default: null, min: 0 },
+    retailPrice: { type: Number, default: null, min: 0 },
     sellingPrice: { type: Number, required: true, min: 0 },
     stock: { type: Number, required: true, default: 0, min: 0 },
     image: { type: String, default: "" }, // base64 data URL
@@ -24,12 +27,12 @@ const productSchema = new mongoose.Schema(
 );
 
 productSchema.virtual("margin").get(function margin() {
-  if (!this.sellingPrice) return 0;
+  if (this.costPrice == null || !this.sellingPrice) return null;
   return Number((this.sellingPrice - this.costPrice).toFixed(2));
 });
 
 productSchema.virtual("marginPercent").get(function marginPercent() {
-  if (!this.sellingPrice) return 0;
+  if (this.costPrice == null || !this.sellingPrice) return null;
   return Number(((this.sellingPrice - this.costPrice) / this.sellingPrice * 100).toFixed(2));
 });
 

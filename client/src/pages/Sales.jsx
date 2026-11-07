@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState, useCallback } from "react";
 import { motion } from "framer-motion";
 import toast from "react-hot-toast";
 import { useDebounce } from "../hooks/useDebounce.js";
+import { useFinancialMutation } from "../hooks/useFinancialMutation.js";
 import {
   Plus,
   Search,
@@ -20,23 +21,24 @@ import {
 } from "lucide-react";
 import { api } from "../api/client.js";
 import { formatINR, formatDate, relativeTime } from "../lib/format.js";
+import { buildInvoicePrintHtml } from "../lib/invoicePrint.js";
 import PageHeader from "../components/PageHeader.jsx";
 import Modal from "../components/Modal.jsx";
 import EmptyState from "../components/EmptyState.jsx";
 import Select from "../components/Select.jsx";
 
 // --- shared invoice actions (used by both the list rows and the invoice view) ---
-async function downloadInvoicePdf(saleId, invoiceNumber) {
+async function downloadInvoicePdf(saleId, invoiceNumber, format = "a4") {
   try {
-    const res = await api.get(`/sales/${saleId}/invoice/pdf`, { responseType: "blob" });
+    const res = await api.get(`/sales/${saleId}/invoice/pdf`, { params: { format }, responseType: "blob" });
     const url = URL.createObjectURL(new Blob([res.data], { type: "application/pdf" }));
     const a = document.createElement("a");
     a.href = url;
-    a.download = `Invoice-${invoiceNumber || saleId}.pdf`;
+    a.download = `Invoice-${invoiceNumber || saleId}-${format}.pdf`;
     document.body.appendChild(a);
     a.click();
     a.remove();
-    URL.revokeObjectURL(url);
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
   } catch (err) {
     toast.error(err.message || "Could not download the PDF");
   }
@@ -72,6 +74,42 @@ const DATE_PRESETS = [
 ];
 
 const round2 = (n) => Math.round((Number(n) || 0) * 100) / 100;
+
+function estimateReturnRefund(items, saleTotal, requestedItems) {
+  const weights = items.map((item) => item.subtotal != null
+    ? Number(item.subtotal) || 0
+    : (Number(item.unitPrice) || 0) * (Number(item.quantity) || 0));
+  const totalCents = Math.max(0, Math.round((Number(saleTotal) || 0) * 100));
+  const weightCents = weights.map((weight) => Math.max(0, Math.round(weight * 100)));
+  const weightTotal = weightCents.reduce((sum, value) => sum + value, 0);
+  const exact = weightCents.map((value) => weightTotal ? (totalCents * value) / weightTotal : 0);
+  const allocated = exact.map(Math.floor);
+  let remainder = totalCents - allocated.reduce((sum, value) => sum + value, 0);
+  const order = exact
+    .map((value, index) => ({ index, fraction: value - allocated[index] }))
+    .sort((a, b) => b.fraction - a.fraction || a.index - b.index);
+  for (let i = 0; i < remainder && order.length; i += 1) allocated[order[i].index] += 1;
+
+  const requestedByProduct = new Map();
+  for (const request of requestedItems) {
+    const id = String(request.productId);
+    requestedByProduct.set(id, (requestedByProduct.get(id) || 0) + Number(request.quantity || 0));
+  }
+  let refundCents = 0;
+  for (const [id, requested] of requestedByProduct) {
+    let remaining = requested;
+    for (const [index, item] of items.entries()) {
+      if (String(item.product) !== id || remaining <= 0) continue;
+      const oldReturned = Number(item.returnedQty) || 0;
+      const quantity = Math.min(Math.max(0, Number(item.quantity || 0) - oldReturned), remaining);
+      if (!quantity) continue;
+      refundCents += Math.round((allocated[index] * (oldReturned + quantity)) / item.quantity)
+        - Math.round((allocated[index] * oldReturned) / item.quantity);
+      remaining -= quantity;
+    }
+  }
+  return refundCents / 100;
+}
 
 // Timezone-safe day boundaries (Sprint 1.1 — Issue #1): compute the user's LOCAL
 // day start/end and send absolute ISO instants so the server filters consistently
@@ -345,6 +383,8 @@ const CUSTOMER_TYPES = [
 ];
 
 function NewSaleModal({ onClose, onCreated }) {
+  const financialMutation = useFinancialMutation("/sales");
+  const [saleType, setSaleType] = useState("wholesale");
   const [step, setStep] = useState(1); // 1: customer, 2: items, 3: payment
   const [customers, setCustomers] = useState([]);
   const [products, setProducts] = useState([]);
@@ -352,17 +392,16 @@ function NewSaleModal({ onClose, onCreated }) {
 
   const [customerType, setCustomerType] = useState("existing");
   const [customer, setCustomer] = useState(null); // existing
-  const [newCustomer, setNewCustomer] = useState({ name: "", phone: "", shopName: "" });
+  const [newCustomer, setNewCustomer] = useState({ name: "", phone: "", shopName: "", address: "", gstNumber: "" });
   const [walkInName, setWalkInName] = useState("");
 
   const [items, setItems] = useState([]);
   const [pay, setPay] = useState({ cash: "", upi: "", bank: "" });
-  const [submitting, setSubmitting] = useState(false);
   const [q, setQ] = useState("");
   const [pq, setPq] = useState("");
 
   const debouncedQ = useDebounce(q, 250);
-  const debouncedPq = useDebounce(pq, 250);
+  const debouncedPq = useDebounce(pq, 150);
 
   // Customer search (Feature 4) — debounced, server-backed.
   useEffect(() => {
@@ -410,13 +449,20 @@ function NewSaleModal({ onClose, onCreated }) {
     const bv = Number(billDisc.value) || 0;
     const billAmt = billDisc.type === "percent" ? (subtotal * Math.min(100, bv)) / 100 : Math.min(bv, subtotal);
     const total = Math.max(0, subtotal - billAmt);
-    return { subtotal: round2(subtotal), billAmt: round2(billAmt), totalDiscount: round2(itemDisc + billAmt), total: round2(total) };
+    return {
+      grossSubtotal: round2(gross),
+      itemDiscountTotal: round2(itemDisc),
+      subtotal: round2(subtotal),
+      billAmt: round2(billAmt),
+      totalDiscount: round2(itemDisc + billAmt),
+      total: round2(total),
+    };
   }, [items, billDisc]);
   const total = calc.total;
   const paidSum = (Number(pay.cash) || 0) + (Number(pay.upi) || 0) + (Number(pay.bank) || 0);
-  const paid = Math.min(paidSum, total);
+  const paid = paidSum;
   const due = Math.max(0, total - paidSum);
-  const change = Math.max(0, paidSum - total);
+  const overpayment = Math.max(0, paidSum - total);
 
   const lineNet = (it) => {
     const g = it.unitPrice * it.quantity;
@@ -432,6 +478,14 @@ function NewSaleModal({ onClose, onCreated }) {
   const displaySub =
     customerType === "existing" ? customer?.shopName || customer?.phone : customerType === "new" ? newCustomer.phone : "No ledger entry";
 
+  const close = () => {
+    if (financialMutation.submitting || financialMutation.pending) {
+      toast.error("Retry the pending sale or discard it before closing.");
+      return;
+    }
+    onClose();
+  };
+
   const step1Valid =
     customerType === "existing" ? !!customer : customerType === "new" ? newCustomer.name && newCustomer.phone : true;
 
@@ -445,22 +499,48 @@ function NewSaleModal({ onClose, onCreated }) {
         }
         return prev.map((x) => (x.productId === p._id ? { ...x, quantity: x.quantity + 1 } : x));
       }
-      return [...prev, { productId: p._id, name: p.name, color: p.color, size: p.size, unitPrice: p.sellingPrice, quantity: 1, max: p.stock, discountType: "amount", discountValue: 0 }];
+      const wholesalePrice = Number(p.wholesalePrice ?? p.sellingPrice) || 0;
+      const retailPrice = Number(p.retailPrice ?? wholesalePrice * 2) || 0;
+      return [...prev, {
+        productId: p._id,
+        name: p.name,
+        color: p.color,
+        size: p.size,
+        wholesalePrice,
+        retailPrice,
+        unitPrice: saleType === "retail" ? retailPrice : wholesalePrice,
+        quantity: 1,
+        max: p.stock,
+        discountType: "amount",
+        discountValue: 0,
+      }];
     });
   };
   const updateQty = (productId, qty) =>
-    setItems((prev) => prev.map((it) => (it.productId === productId ? { ...it, quantity: Math.max(1, Math.min(it.max, qty)) } : it)));
+    setItems((prev) => prev.map((it) => (it.productId === productId
+      ? { ...it, quantity: Math.max(1, Math.min(it.max, Math.trunc(Number(qty) || 1))) }
+      : it)));
   const removeItem = (productId) => setItems((prev) => prev.filter((it) => it.productId !== productId));
+  const changeSaleType = (nextType) => {
+    setSaleType(nextType);
+    setItems((prev) => prev.map((item) => ({
+      ...item,
+      unitPrice: nextType === "retail" ? item.retailPrice : item.wholesalePrice,
+    })));
+  };
 
   const markFullCash = () => setPay({ cash: String(total - (Number(pay.upi) || 0) - (Number(pay.bank) || 0)), upi: pay.upi, bank: pay.bank });
 
   const submit = async () => {
     if (!step1Valid || items.length === 0) return;
+    if (overpayment > 0) {
+      toast.error("Payment splits cannot exceed the sale total.");
+      return;
+    }
     if (customerType === "walkin" && due > 0) {
       toast.error("Walk-in sales must be fully paid.");
       return;
     }
-    setSubmitting(true);
     const payments = [
       { method: "cash", amount: Number(pay.cash) || 0 },
       { method: "upi", amount: Number(pay.upi) || 0 },
@@ -469,6 +549,7 @@ function NewSaleModal({ onClose, onCreated }) {
 
     const payload = {
       customerType,
+      saleType,
       items: items.map((it) => ({
         productId: it.productId,
         quantity: it.quantity,
@@ -484,20 +565,20 @@ function NewSaleModal({ onClose, onCreated }) {
     if (customerType === "walkin") payload.walkInName = walkInName;
 
     try {
-      const { data } = await api.post("/sales", payload);
+      const response = await financialMutation.submit(payload);
+      if (!response) return;
+      const { data } = response;
       toast.success("Sale recorded");
       onCreated(data.sale);
     } catch (err) {
       toast.error(err.message);
-    } finally {
-      setSubmitting(false);
     }
   };
 
   return (
     <Modal
       open
-      onClose={onClose}
+      onClose={close}
       title="New sale"
       size="xl"
       footer={
@@ -508,27 +589,51 @@ function NewSaleModal({ onClose, onCreated }) {
             {step === 3 && due > 0 && <span className="text-rose-500 ml-2">· Due {formatINR(due)}</span>}
           </div>
           <div className="flex gap-2">
+            {financialMutation.pending && (
+              <button onClick={() => { try { financialMutation.abandon(); } catch (err) { toast.error(err.message); } }} disabled={financialMutation.submitting} className="btn-outline">
+                Discard pending sale
+              </button>
+            )}
             {step > 1 && (
-              <button onClick={() => setStep(step - 1)} className="btn-outline">Back</button>
+              <button onClick={() => setStep(step - 1)} disabled={financialMutation.pending || financialMutation.submitting} className="btn-outline">Back</button>
             )}
             {step < 3 && (
               <button
                 onClick={() => setStep(step + 1)}
-                disabled={(step === 1 && !step1Valid) || (step === 2 && items.length === 0)}
+                disabled={financialMutation.pending || financialMutation.submitting || (step === 1 && !step1Valid) || (step === 2 && items.length === 0)}
                 className="btn-primary"
               >
                 Continue
               </button>
             )}
             {step === 3 && (
-              <button onClick={submit} disabled={submitting} className="btn-primary">
-                {submitting ? "Recording…" : "Record sale"}
+              <button onClick={submit} disabled={financialMutation.submitting || overpayment > 0} className="btn-primary">
+                {financialMutation.submitting ? "Recording…" : "Record sale"}
               </button>
             )}
           </div>
         </div>
       }
     >
+      <fieldset disabled={financialMutation.pending || financialMutation.submitting} className="border-0 p-0 m-0 min-w-0">
+      <div className="flex items-center justify-between gap-3 mb-4 rounded-xl border border-ink-200/60 bg-ink-50/60 p-3">
+        <div>
+          <div className="text-sm font-semibold text-ink-800">Sale pricing</div>
+          <div className="text-xs text-ink-500">Current mode: {saleType === "wholesale" ? "Wholesale" : "Retail"}</div>
+        </div>
+        <div className="flex rounded-lg border border-ink-200 bg-white p-1">
+          {["wholesale", "retail"].map((type) => (
+            <button
+              key={type}
+              type="button"
+              onClick={() => changeSaleType(type)}
+              className={`rounded-md px-3 py-1.5 text-xs font-semibold capitalize ${saleType === type ? "bg-brand-500 text-white" : "text-ink-600 hover:bg-ink-50"}`}
+            >
+              {type}
+            </button>
+          ))}
+        </div>
+      </div>
       {/* Step indicator */}
       <div className="flex items-center gap-2 mb-5">
         {["Customer", "Items", "Payment"].map((label, i) => {
@@ -622,6 +727,14 @@ function NewSaleModal({ onClose, onCreated }) {
                       <label className="label">Shop name</label>
                       <input className="input" placeholder="optional" value={newCustomer.shopName} onChange={(e) => setNewCustomer({ ...newCustomer, shopName: e.target.value })} />
                     </div>
+                    <div>
+                      <label className="label">Billing address</label>
+                      <input className="input" placeholder="optional" value={newCustomer.address} onChange={(e) => setNewCustomer({ ...newCustomer, address: e.target.value })} />
+                    </div>
+                    <div>
+                      <label className="label">Customer GSTIN</label>
+                      <input className="input" placeholder="optional" value={newCustomer.gstNumber} onChange={(e) => setNewCustomer({ ...newCustomer, gstNumber: e.target.value })} />
+                    </div>
                   </div>
                 </div>
               )}
@@ -648,9 +761,9 @@ function NewSaleModal({ onClose, onCreated }) {
               <div>
                 <div className="card !p-3 mb-3 flex items-center gap-3">
                   <Search className="w-4 h-4 text-ink-400" />
-                  <input className="flex-1 outline-none bg-transparent text-sm" placeholder="Search products in stock…" value={pq} onChange={(e) => setPq(e.target.value)} />
+                  <input className="flex-1 outline-none bg-transparent text-sm" placeholder="Search name or SKU…" value={pq} onChange={(e) => setPq(e.target.value)} />
                 </div>
-                <div className="space-y-1 max-h-80 overflow-y-auto">
+                <div className="space-y-1 max-h-[28rem] overflow-y-auto">
                   {products.length === 0 && <p className="text-sm text-ink-500 text-center py-6">No in-stock products match.</p>}
                   {products.map((p) => (
                     <button key={p._id} onClick={() => addItem(p)} className="w-full flex items-center gap-3 px-3 py-2 rounded-xl hover:bg-ink-50 text-left">
@@ -659,9 +772,15 @@ function NewSaleModal({ onClose, onCreated }) {
                       </div>
                       <div className="flex-1 min-w-0">
                         <div className="font-semibold text-sm text-ink-800 truncate">{p.name}</div>
-                        <div className="text-xs text-ink-500">{[p.color, p.size].filter(Boolean).join(" · ")} · {p.stock} left</div>
+                        <div className="text-xs text-ink-500">{[p.sku, p.color, p.size].filter(Boolean).join(" · ")} · {p.stock} in stock</div>
+                        <div className="text-[11px] text-ink-400">
+                          Wholesale {formatINR(p.wholesalePrice ?? p.sellingPrice)} · Retail {formatINR(p.retailPrice ?? ((p.wholesalePrice ?? p.sellingPrice) * 2))}
+                        </div>
                       </div>
-                      <div className="text-sm font-bold text-ink-700">{formatINR(p.sellingPrice)}</div>
+                      <div className="text-right shrink-0">
+                        <div className="text-[10px] uppercase tracking-wide text-ink-400">{saleType}</div>
+                        <div className="text-sm font-bold text-brand-600">{formatINR(saleType === "retail" ? p.retailPrice : p.wholesalePrice ?? p.sellingPrice)}</div>
+                      </div>
                     </button>
                   ))}
                 </div>
@@ -687,11 +806,12 @@ function NewSaleModal({ onClose, onCreated }) {
                             </div>
                             <div className="flex items-center gap-1 bg-ink-50 rounded-lg px-1">
                               <button onClick={() => updateQty(it.productId, it.quantity - 1)} className="w-7 h-7 text-ink-600 hover:text-brand-500">−</button>
-                              <input type="number" value={it.quantity} onChange={(e) => updateQty(it.productId, Number(e.target.value) || 1)} className="w-10 bg-transparent text-center font-bold text-sm outline-none text-ink-800" />
+                              <input type="number" min="1" max={it.max} step="1" value={it.quantity} aria-label={`Quantity for ${it.name}`} onChange={(e) => updateQty(it.productId, e.target.value)} className="input !py-1 !px-1 w-20 text-center font-bold text-sm" />
                               <button onClick={() => updateQty(it.productId, it.quantity + 1)} className="w-7 h-7 text-ink-600 hover:text-brand-500">+</button>
                             </div>
-                            <div className="text-right w-16 shrink-0">
+                            <div className="text-right min-w-20 shrink-0">
                               <div className="text-sm font-bold text-ink-800">{formatINR(net)}</div>
+                              <div className="text-[10px] text-ink-400">line total</div>
                               {net < gross && <div className="text-[10px] text-ink-400 line-through">{formatINR(gross)}</div>}
                             </div>
                             <button onClick={() => removeItem(it.productId)} className="text-rose-500 hover:bg-rose-500/10 p-1.5 rounded-lg">
@@ -703,6 +823,8 @@ function NewSaleModal({ onClose, onCreated }) {
                             <input
                               type="number"
                               min="0"
+                              max={it.discountType === "percent" ? 100 : undefined}
+                              step="0.01"
                               value={it.discountValue || ""}
                               onChange={(e) => updateItem(it.productId, { discountValue: Number(e.target.value) || 0 })}
                               className="input !py-1 !px-2 text-xs flex-1"
@@ -753,13 +875,25 @@ function NewSaleModal({ onClose, onCreated }) {
                   </div>
                   <div className="flex items-center gap-2">
                     <span className="text-sm text-ink-500 flex-1">Bill discount</span>
-                    <input type="number" min="0" value={billDisc.value} onChange={(e) => setBillDisc({ ...billDisc, value: e.target.value })} className="input !py-1 !px-2 text-xs w-24" placeholder="0" />
+                    <input type="number" min="0" max={billDisc.type === "percent" ? 100 : undefined} step="0.01" value={billDisc.value} onChange={(e) => setBillDisc({ ...billDisc, value: e.target.value })} className="input !py-1 !px-2 text-xs w-24" placeholder="0" />
                     <div className="flex bg-ink-50 rounded-lg overflow-hidden border border-ink-200/60">
                       {["amount", "percent"].map((t) => (
                         <button key={t} onClick={() => setBillDisc({ ...billDisc, type: t })} className={`px-2.5 py-1 text-xs font-semibold ${billDisc.type === t ? "bg-brand-500 text-white" : "text-ink-500"}`}>{t === "amount" ? "₹" : "%"}</button>
                       ))}
                     </div>
                   </div>
+                  {calc.itemDiscountTotal > 0 && (
+                    <div className="flex items-center justify-between text-sm">
+                      <span className="text-ink-500">Item discounts</span>
+                      <span className="font-medium text-emerald-500">−{formatINR(calc.itemDiscountTotal)}</span>
+                    </div>
+                  )}
+                  {calc.billAmt > 0 && (
+                    <div className="flex items-center justify-between text-sm">
+                      <span className="text-ink-500">Bill discount ({billDisc.type === "percent" ? `${Number(billDisc.value) || 0}%` : "flat"})</span>
+                      <span className="font-medium text-emerald-500">−{formatINR(calc.billAmt)}</span>
+                    </div>
+                  )}
                   {calc.totalDiscount > 0 && (
                     <div className="flex items-center justify-between text-sm">
                       <span className="text-ink-500">Total discount</span>
@@ -812,10 +946,10 @@ function NewSaleModal({ onClose, onCreated }) {
                   <span className="text-ink-500">Paid</span>
                   <span className="font-semibold text-emerald-500">{formatINR(paid)}</span>
                 </div>
-                {change > 0 && (
+                {overpayment > 0 && (
                   <div className="flex items-center justify-between text-sm">
-                    <span className="text-ink-500">Change to return</span>
-                    <span className="font-semibold text-ink-700">{formatINR(change)}</span>
+                    <span className="text-rose-500">Overpayment not allowed</span>
+                    <span className="font-semibold text-rose-500">{formatINR(overpayment)}</span>
                   </div>
                 )}
                 <div className="flex items-center justify-between">
@@ -833,16 +967,34 @@ function NewSaleModal({ onClose, onCreated }) {
           )}
         </>
       )}
+      </fieldset>
     </Modal>
   );
 }
 
 function InvoiceModal({ invoice, onClose, onChanged }) {
   const methodLabel = { cash: "Cash", upi: "UPI", bank: "Bank", card: "Card", credit: "Credit", split: "Split" };
+  const [printFormat, setPrintFormat] = useState("a4");
   const [returnOpen, setReturnOpen] = useState(false);
   const [replaceOpen, setReplaceOpen] = useState(false);
   const [history, setHistory] = useState([]);
   const returnable = (invoice.items || []).some((it) => (it.quantity || 0) - (it.returnedQty || 0) > 0);
+  const printInvoice = () => {
+    let printWindow;
+    try {
+      printWindow = window.open("", "_blank");
+      if (!printWindow) {
+        toast.error("Allow pop-ups to open the print preview.");
+        return;
+      }
+      printWindow.document.open();
+      printWindow.document.write(buildInvoicePrintHtml({ ...invoice, returnHistory: history }, printFormat));
+      printWindow.document.close();
+    } catch (error) {
+      printWindow?.close();
+      toast.error(error.message || "Could not open invoice print preview.");
+    }
+  };
   useEffect(() => {
     api.get(`/sales/${invoice.saleId}/returns`).then(({ data }) => setHistory(data.records || [])).catch(() => {});
   }, [invoice.saleId]);
@@ -878,9 +1030,21 @@ function InvoiceModal({ invoice, onClose, onChanged }) {
                 <Send className="w-3.5 h-3.5" /> Resend WhatsApp
               </button>
             )}
-            <button onClick={() => downloadInvoicePdf(invoice.saleId, invoice.invoiceNumber)} className="btn-primary text-xs">
-              <Download className="w-3.5 h-3.5" /> Download PDF
+            <button onClick={() => downloadInvoicePdf(invoice.saleId, invoice.invoiceNumber, printFormat)} className="btn-primary text-xs">
+              <Download className="w-3.5 h-3.5" /> Download {printFormat === "a4" ? "A4" : printFormat === "thermal80" ? "80mm" : "58mm"} PDF
             </button>
+            <label className="sr-only" htmlFor="invoice-print-format">Invoice print format</label>
+            <select
+              id="invoice-print-format"
+              className="input !py-1.5 !px-2 text-xs w-auto"
+              value={printFormat}
+              onChange={(event) => setPrintFormat(event.target.value)}
+            >
+              <option value="a4">A4</option>
+              <option value="thermal80">Thermal 80mm</option>
+              <option value="thermal58">Thermal 58mm</option>
+            </select>
+            <button onClick={printInvoice} className="btn-outline text-xs">Print</button>
           </div>
         </div>
       }
@@ -892,6 +1056,8 @@ function InvoiceModal({ invoice, onClose, onChanged }) {
             {invoice.business?.logo && <img src={invoice.business.logo} alt="" className="w-12 h-12 rounded-xl object-cover" />}
             <div>
               <div className="font-display font-extrabold text-2xl text-ink-900">{invoice.business?.name || "Bizzrow"}</div>
+              {invoice.business?.address && <div className="text-xs text-ink-500">{invoice.business.address}</div>}
+              {invoice.business?.email && <div className="text-xs text-ink-500">{invoice.business.email}</div>}
               {invoice.business?.gstNumber && <div className="text-xs text-ink-500">GST: {invoice.business.gstNumber}</div>}
               {invoice.business?.phone && <div className="text-xs text-ink-500">Phone: {invoice.business.phone}</div>}
             </div>
@@ -899,6 +1065,7 @@ function InvoiceModal({ invoice, onClose, onChanged }) {
           <div className="text-right">
             <div className="text-xs text-ink-500 uppercase tracking-wider font-semibold">Invoice</div>
             <div className="font-mono font-bold text-ink-900">{invoice.invoiceNumber}</div>
+            <div className="text-[11px] text-ink-500 capitalize">{invoice.saleType || "wholesale"} pricing</div>
             <div className="text-xs text-ink-500 mt-1">{formatDate(invoice.date, { year: true })}</div>
           </div>
         </div>
@@ -907,14 +1074,21 @@ function InvoiceModal({ invoice, onClose, onChanged }) {
           <div className="text-xs uppercase tracking-wider text-ink-500 font-semibold">Bill to</div>
           <div className="font-semibold text-ink-800">{invoice.customer}{invoice.customerType === "walkin" && <span className="text-ink-400 font-normal"> · walk-in</span>}</div>
           {invoice.customerPhone && <div className="text-xs text-ink-500 mt-0.5">{invoice.customerPhone}</div>}
+          {invoice.customerShopName && <div className="text-xs text-ink-500">{invoice.customerShopName}</div>}
+          {invoice.customerAddress && <div className="text-xs text-ink-500">{invoice.customerAddress}</div>}
+          {invoice.customerGstNumber && <div className="text-xs text-ink-500">GSTIN: {invoice.customerGstNumber}</div>}
         </div>
 
-        <table className="w-full mt-3 text-sm">
+        <div className="overflow-x-auto">
+        <table className="w-full min-w-[690px] mt-3 text-sm">
           <thead>
             <tr className="border-b border-ink-200/60 text-left text-xs uppercase tracking-wider text-ink-500">
               <th className="py-2 font-semibold">Item</th>
               <th className="py-2 font-semibold text-right">Qty</th>
+              <th className="py-2 font-semibold text-right">Unit</th>
               <th className="py-2 font-semibold text-right">Rate</th>
+              <th className="py-2 font-semibold text-right">Discount</th>
+              <th className="py-2 font-semibold text-right">Tax</th>
               <th className="py-2 font-semibold text-right">Amount</th>
             </tr>
           </thead>
@@ -923,25 +1097,39 @@ function InvoiceModal({ invoice, onClose, onChanged }) {
               <tr key={i} className="border-b border-ink-200/40">
                 <td className="py-2.5">
                   <div className="font-medium text-ink-800">{it.name}</div>
+                  {it.sku && <div className="text-xs text-ink-500">SKU: {it.sku}</div>}
                   {(it.color || it.size) && <div className="text-xs text-ink-500">{[it.color, it.size].filter(Boolean).join(" · ")}</div>}
                   {it.discountAmount > 0 && (
                     <div className="text-[11px] text-emerald-500">Disc {it.discountType === "percent" ? `${it.discountValue}%` : formatINR(it.discountValue)} (−{formatINR(it.discountAmount)})</div>
                   )}
                 </td>
                 <td className="py-2.5 text-right text-ink-700">{it.quantity}</td>
+                <td className="py-2.5 text-right text-ink-700">{it.unit || "—"}</td>
                 <td className="py-2.5 text-right text-ink-700">{formatINR(it.unitPrice)}</td>
+                <td className="py-2.5 text-right text-ink-700">{Number(it.discountAmount) ? formatINR(it.discountAmount) : "—"}</td>
+                <td className="py-2.5 text-right text-ink-700">{Number(it.taxAmount) ? formatINR(it.taxAmount) : "—"}</td>
                 <td className="py-2.5 text-right font-medium text-ink-800">{formatINR(it.subtotal)}</td>
               </tr>
             ))}
           </tbody>
         </table>
+        </div>
+        {!(invoice.taxBreakdown?.length) && !(invoice.items || []).some((item) => Number(item.taxAmount)) && (
+          <p className="text-[11px] text-ink-400 mt-2">Tax was not itemized in the saved sale.</p>
+        )}
 
         <div className="mt-4 ml-auto max-w-xs space-y-1.5 text-sm">
-          {invoice.totalDiscount > 0 && (
-            <>
-              <Row label="Subtotal" value={formatINR(invoice.subtotal)} />
-              <Row label="Discount" value={`− ${formatINR(invoice.totalDiscount)}`} positive />
-            </>
+          <Row label="Items subtotal" value={formatINR(invoice.subtotal ?? invoice.total)} />
+          {invoice.itemDiscountTotal > 0 && <Row label="Line discounts (included above)" value={`− ${formatINR(invoice.itemDiscountTotal)}`} positive />}
+          {invoice.billDiscountAmount > 0 && (
+            <Row
+              label={invoice.billDiscountType === "percent" ? `Bill discount (${invoice.billDiscountValue}%)` : "Bill discount"}
+              value={`− ${formatINR(invoice.billDiscountAmount)}`}
+              positive
+            />
+          )}
+          {!invoice.billDiscountAmount && invoice.totalDiscount > 0 && !invoice.itemDiscountTotal && (
+            <Row label="Discount" value={`− ${formatINR(invoice.totalDiscount)}`} positive />
           )}
           <Row label="Total" value={formatINR(invoice.total)} />
           {invoice.returnedAmount > 0 && (
@@ -955,6 +1143,14 @@ function InvoiceModal({ invoice, onClose, onChanged }) {
           <Row label="Paid" value={formatINR(invoice.amountPaid)} positive />
           <Row label="Due" value={formatINR(invoice.dueAmount)} negative={invoice.dueAmount > 0} bold />
         </div>
+        {Array.isArray(invoice.invoiceTerms) && invoice.invoiceTerms.length > 0 && (
+          <div className="mt-5 pt-4 border-t border-ink-200/50">
+            <div className="text-xs font-semibold uppercase tracking-wider text-ink-500 mb-2">Terms and conditions</div>
+            <ol className="list-decimal pl-5 space-y-1 text-xs text-ink-600">
+              {invoice.invoiceTerms.map((term, index) => <li key={`${invoice.saleId}-term-${index}`}>{term}</li>)}
+            </ol>
+          </div>
+        )}
 
         {history.length > 0 && (
           <div className="mt-5 pt-4 border-t border-ink-200/50">
@@ -975,7 +1171,7 @@ function InvoiceModal({ invoice, onClose, onChanged }) {
 
         <div className="mt-6 pt-4 border-t border-ink-200/50 flex items-center justify-between text-xs text-ink-500">
           <span>Thank you for your business 🙏</span>
-          <button onClick={() => window.print()} className="btn-outline text-xs !py-2 !px-3">Print</button>
+          <span>{invoice.invoiceNumber}</span>
         </div>
       </div>
     </Modal>
@@ -983,6 +1179,7 @@ function InvoiceModal({ invoice, onClose, onChanged }) {
       <ReturnModal
         saleId={invoice.saleId}
         items={invoice.items}
+        saleTotal={invoice.total}
         onClose={() => setReturnOpen(false)}
         onDone={() => { setReturnOpen(false); onClose(); onChanged && onChanged(); }}
       />
@@ -991,6 +1188,8 @@ function InvoiceModal({ invoice, onClose, onChanged }) {
       <ReplacementModal
         saleId={invoice.saleId}
         items={invoice.items}
+        saleTotal={invoice.total}
+        saleType={invoice.saleType || "wholesale"}
         onClose={() => setReplaceOpen(false)}
         onDone={() => { setReplaceOpen(false); onClose(); onChanged && onChanged(); }}
       />
@@ -999,14 +1198,23 @@ function InvoiceModal({ invoice, onClose, onChanged }) {
   );
 }
 
-function ReplacementModal({ saleId, items, onClose, onDone }) {
+function ReplacementModal({ saleId, items, saleTotal, saleType = "wholesale", onClose, onDone }) {
+  const mutationPath = `/sales/${saleId}/replace`;
+  const financialMutation = useFinancialMutation(mutationPath);
   const [retQtys, setRetQtys] = useState({});
   const [cart, setCart] = useState([]);
   const [pq, setPq] = useState("");
   const [products, setProducts] = useState([]);
   const [pay, setPay] = useState("");
-  const [submitting, setSubmitting] = useState(false);
   const dq = useDebounce(pq, 250);
+
+  const close = () => {
+    if (financialMutation.submitting || financialMutation.pending) {
+      toast.error("Retry the pending replacement or discard it before closing.");
+      return;
+    }
+    onClose();
+  };
 
   const returnRows = (items || [])
     .map((it) => ({ ...it, returnable: (it.quantity || 0) - (it.returnedQty || 0) }))
@@ -1025,7 +1233,11 @@ function ReplacementModal({ saleId, items, onClose, onDone }) {
     })();
   }, [dq]);
 
-  const refund = returnRows.reduce((a, it) => a + (Number(retQtys[it.product]) || 0) * (it.quantity ? it.subtotal / it.quantity : 0), 0);
+  const refund = estimateReturnRefund(
+    items || [],
+    saleTotal,
+    returnRows.map((it) => ({ productId: it.product, quantity: Number(retQtys[it.product]) || 0 }))
+  );
   const replacement = cart.reduce((a, c) => a + c.unitPrice * c.quantity, 0);
   const diff = round2(replacement - refund);
 
@@ -1033,7 +1245,15 @@ function ReplacementModal({ saleId, items, onClose, onDone }) {
     setCart((prev) => {
       const ex = prev.find((x) => x.productId === p._id);
       if (ex) return prev.map((x) => (x.productId === p._id ? { ...x, quantity: Math.min(x.max, x.quantity + 1) } : x));
-      return [...prev, { productId: p._id, name: p.name, unitPrice: p.sellingPrice, quantity: 1, max: p.stock }];
+      const wholesalePrice = Number(p.wholesalePrice ?? p.sellingPrice) || 0;
+      const retailPrice = Number(p.retailPrice ?? wholesalePrice * 2) || 0;
+      return [...prev, {
+        productId: p._id,
+        name: p.name,
+        unitPrice: saleType === "retail" ? retailPrice : wholesalePrice,
+        quantity: 1,
+        max: p.stock,
+      }];
     });
 
   const submit = async () => {
@@ -1044,22 +1264,21 @@ function ReplacementModal({ saleId, items, onClose, onDone }) {
       return;
     }
     const payments = diff > 0 && Number(pay) > 0 ? [{ method: "cash", amount: Math.min(Number(pay), diff) }] : [];
-    setSubmitting(true);
     try {
-      const { data } = await api.post(`/sales/${saleId}/replace`, { returnItems, newItems, payments });
+      const response = await financialMutation.submit({ returnItems, newItems, payments });
+      if (!response) return;
+      const { data } = response;
       toast.success(`Replacement done · difference ${formatINR(data.priceDifference)}`);
       onDone();
     } catch (err) {
       toast.error(err.message);
-    } finally {
-      setSubmitting(false);
     }
   };
 
   return (
     <Modal
       open
-      onClose={onClose}
+      onClose={close}
       title="Replace items"
       size="xl"
       footer={
@@ -1068,10 +1287,20 @@ function ReplacementModal({ saleId, items, onClose, onDone }) {
             <span className="text-ink-500">Difference: </span>
             <span className={`font-bold ${diff > 0 ? "text-rose-500" : "text-emerald-500"}`}>{diff > 0 ? `Customer pays ${formatINR(diff)}` : diff < 0 ? `Refund ${formatINR(-diff)}` : "Even"}</span>
           </div>
-          <button onClick={submit} disabled={submitting} className="btn-primary">{submitting ? "Processing…" : "Confirm replacement"}</button>
+          <div className="flex gap-2">
+            {financialMutation.pending && (
+              <button onClick={() => { try { financialMutation.abandon(); } catch (err) { toast.error(err.message); } }} disabled={financialMutation.submitting} className="btn-outline">
+                Discard pending
+              </button>
+            )}
+            <button onClick={submit} disabled={financialMutation.submitting} className="btn-primary">
+              {financialMutation.submitting ? "Processing…" : "Confirm replacement"}
+            </button>
+          </div>
         </div>
       }
     >
+      <fieldset disabled={financialMutation.pending || financialMutation.submitting} className="border-0 p-0 m-0 min-w-0">
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
         <div>
           <h4 className="text-xs font-semibold uppercase tracking-wider text-ink-500 mb-2">Return from this sale</h4>
@@ -1098,14 +1327,14 @@ function ReplacementModal({ saleId, items, onClose, onDone }) {
             {products.map((p) => (
               <button key={p._id} onClick={() => addCart(p)} className="w-full flex items-center justify-between px-2 py-1.5 rounded-lg hover:bg-ink-50 text-left text-sm">
                 <span className="text-ink-800 truncate">{p.name}</span>
-                <span className="text-ink-500">{formatINR(p.sellingPrice)}</span>
+                <span className="text-ink-500">{formatINR(saleType === "retail" ? p.retailPrice ?? (p.sellingPrice * 2) : p.wholesalePrice ?? p.sellingPrice)}</span>
               </button>
             ))}
           </div>
           {cart.map((c) => (
             <div key={c.productId} className="flex items-center gap-2 text-sm py-1">
               <span className="flex-1 truncate text-ink-800">{c.name}</span>
-              <span className="text-ink-500">× {c.quantity}</span>
+              <input type="number" min="1" max={c.max} step="1" value={c.quantity} aria-label={`Quantity for ${c.name}`} onChange={(e) => setCart((prev) => prev.map((item) => item.productId === c.productId ? { ...item, quantity: Math.max(1, Math.min(item.max, Math.trunc(Number(e.target.value) || 1))) } : item))} className="input !py-1 !px-1 w-20 text-center" />
               <span className="font-semibold text-ink-800 w-16 text-right">{formatINR(c.unitPrice * c.quantity)}</span>
               <button onClick={() => setCart((prev) => prev.filter((x) => x.productId !== c.productId))} className="text-rose-500"><Trash2 className="w-3.5 h-3.5" /></button>
             </div>
@@ -1119,54 +1348,74 @@ function ReplacementModal({ saleId, items, onClose, onDone }) {
           )}
         </div>
       </div>
+      </fieldset>
     </Modal>
   );
 }
 
 const RETURN_REASONS = ["Defective", "Wrong item", "Customer changed mind", "Damaged", "Other"];
 
-function ReturnModal({ saleId, items, onClose, onDone }) {
+function ReturnModal({ saleId, items, saleTotal, onClose, onDone }) {
+  const mutationPath = `/sales/${saleId}/return`;
+  const financialMutation = useFinancialMutation(mutationPath);
   const [qtys, setQtys] = useState({});
   const [reason, setReason] = useState("Defective");
   const [notes, setNotes] = useState("");
-  const [submitting, setSubmitting] = useState(false);
   const rows = (items || [])
     .map((it) => ({ ...it, returnable: (it.quantity || 0) - (it.returnedQty || 0) }))
     .filter((it) => it.returnable > 0);
   const totalSelected = rows.reduce((a, it) => a + (Number(qtys[it.product]) || 0), 0);
+  const estimatedRefund = estimateReturnRefund(
+    items || [],
+    saleTotal,
+    rows.map((it) => ({ productId: it.product, quantity: Number(qtys[it.product]) || 0 }))
+  );
+
+  const close = () => {
+    if (financialMutation.submitting || financialMutation.pending) {
+      toast.error("Retry the pending return or discard it before closing.");
+      return;
+    }
+    onClose();
+  };
 
   const submit = async () => {
     const payloadItems = rows
       .map((it) => ({ productId: it.product, quantity: Number(qtys[it.product]) || 0 }))
       .filter((x) => x.quantity > 0);
     if (payloadItems.length === 0) return;
-    setSubmitting(true);
     try {
-      const { data } = await api.post(`/sales/${saleId}/return`, { items: payloadItems, reason, notes });
+      const response = await financialMutation.submit({ items: payloadItems, reason, notes });
+      if (!response) return;
+      const { data } = response;
       toast.success(`Returned — ${formatINR(data.refund)} credited`);
       onDone();
     } catch (err) {
       toast.error(err.message);
-    } finally {
-      setSubmitting(false);
     }
   };
 
   return (
     <Modal
       open
-      onClose={onClose}
+      onClose={close}
       title="Return items"
       footer={
         <div className="flex justify-end gap-2">
-          <button onClick={onClose} className="btn-outline">Cancel</button>
-          <button onClick={submit} disabled={submitting || totalSelected === 0} className="btn-primary">
-            {submitting ? "Processing…" : "Process return"}
+          {financialMutation.pending && (
+            <button onClick={() => { try { financialMutation.abandon(); } catch (err) { toast.error(err.message); } }} disabled={financialMutation.submitting} className="btn-outline">
+              Discard pending
+            </button>
+          )}
+          <button onClick={close} className="btn-outline">Cancel</button>
+          <button onClick={submit} disabled={financialMutation.submitting || totalSelected === 0} className="btn-primary">
+            {financialMutation.submitting ? "Processing…" : "Process return"}
           </button>
         </div>
       }
     >
-      <p className="text-sm text-ink-500 mb-3">Select quantities to return. Stock, ledger, and profit update automatically.</p>
+      <fieldset disabled={financialMutation.pending || financialMutation.submitting} className="border-0 p-0 m-0 min-w-0">
+      <p className="text-sm text-ink-500 mb-3">Select quantities to return. The refund estimate includes item and bill discounts; the final amount is confirmed when processed.</p>
       <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 mb-3">
         <div>
           <label className="label">Reason</label>
@@ -1184,7 +1433,9 @@ function ReturnModal({ saleId, items, onClose, onDone }) {
           <div key={it.product} className="flex items-center gap-3 card !p-3">
             <div className="flex-1 min-w-0">
               <div className="font-semibold text-sm text-ink-800 truncate">{it.name}</div>
-              <div className="text-xs text-ink-500">{it.returnable} returnable · {formatINR(it.quantity ? it.subtotal / it.quantity : 0)} each</div>
+              <div className="text-xs text-ink-500">
+                {it.returnable} returnable · about {formatINR(estimateReturnRefund(items || [], saleTotal, [{ productId: it.product, quantity: 1 }]))} refund each
+              </div>
             </div>
             <input
               type="number"
@@ -1199,6 +1450,13 @@ function ReturnModal({ saleId, items, onClose, onDone }) {
         ))}
         {rows.length === 0 && <p className="text-sm text-ink-500 text-center py-4">Nothing left to return on this sale.</p>}
       </div>
+      {totalSelected > 0 && (
+        <div className="mt-4 flex justify-between border-t border-ink-200/60 pt-3 text-sm">
+          <span className="text-ink-500">Estimated refund</span>
+          <span className="font-semibold text-emerald-500">{formatINR(estimatedRefund)}</span>
+        </div>
+      )}
+      </fieldset>
     </Modal>
   );
 }

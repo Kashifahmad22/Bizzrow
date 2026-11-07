@@ -179,6 +179,7 @@ async function sendInvoice({ owner, customer, sale, businessName, upiQr, pdfBuff
   if (Array.isArray(sale.payments) && sale.payments.length > 0) {
     sale.payments.forEach((p) => lines.push(`${methodLabel[p.method] || p.method}: ₹${p.amount}`));
   }
+  if ((sale.creditApplied || 0) > 0) lines.push(`Replacement credit: ₹${sale.creditApplied}`);
   lines.push(`Paid: ₹${sale.amountPaid}`);
   lines.push(sale.dueAmount > 0 ? `Due: ₹${sale.dueAmount}` : `Payment received in full. Thank you! 🙏`);
   lines.push("", "Your invoice has been generated.");

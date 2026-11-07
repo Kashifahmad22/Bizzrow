@@ -7,6 +7,13 @@ import { useAuth } from "../context/AuthContext.jsx";
 import { useTheme } from "../context/ThemeContext.jsx";
 import { initials } from "../lib/format.js";
 
+const DEFAULT_INVOICE_TERMS = [
+  "Return or exchange requests may be considered within {returnPeriodDays} days of the invoice date, subject to the policy communicated at purchase and applicable law.",
+  "Please report any damage or shortage promptly for review.",
+  "Goods showing signs of use, washing, alteration, or customer-caused damage may not be eligible for return or exchange, subject to applicable law.",
+  "Wholesale and retail goods are governed by the return and exchange policy communicated at purchase and applicable law.",
+];
+
 export default function Settings() {
   const { user, refreshUser } = useAuth();
   const { theme, setTheme } = useTheme();
@@ -25,7 +32,14 @@ export default function Settings() {
     e.preventDefault();
     setSaving(true);
     try {
-      await api.put("/settings", { business, preferences });
+      await api.put("/settings", {
+        business: {
+          ...business,
+          invoiceReturnPeriodDays: Number(business.invoiceReturnPeriodDays ?? 7),
+          invoiceTerms: currentInvoiceTerms,
+        },
+        preferences,
+      });
       toast.success("Profile saved");
       refreshUser();
     } catch (err) {
@@ -34,6 +48,10 @@ export default function Settings() {
       setSaving(false);
     }
   };
+
+  const currentInvoiceTerms = Array.isArray(business.invoiceTerms) && business.invoiceTerms.length
+    ? business.invoiceTerms
+    : DEFAULT_INVOICE_TERMS;
 
   const readImage = (file, maxMB, cb) => {
     if (!file) return;
@@ -113,6 +131,74 @@ export default function Settings() {
               <textarea className="input min-h-[70px]" value={business.address || ""} onChange={(e) => setBusiness({ ...business, address: e.target.value })} placeholder="Shop no., street, city, state, PIN" />
             </div>
           </div>
+        </div>
+
+        {/* Invoice policy */}
+        <div className="card">
+          <div className="mb-4">
+            <h2 className="font-display font-bold text-lg text-ink-900">Invoice terms and conditions</h2>
+            <p className="text-sm text-ink-500 mt-1">
+              These terms are saved with new sales. Existing invoices keep the terms captured when they were created.
+            </p>
+          </div>
+          <div className="max-w-xs mb-4">
+            <label className="label" htmlFor="invoice-return-period">Return or exchange period (days)</label>
+            <input
+              id="invoice-return-period"
+              className="input"
+              type="number"
+              min="0"
+              max="365"
+              step="1"
+              value={business.invoiceReturnPeriodDays ?? 7}
+              onChange={(e) => setBusiness({ ...business, invoiceReturnPeriodDays: e.target.value === "" ? "" : Number(e.target.value) })}
+            />
+            <p className="text-xs text-ink-400 mt-1">Use 0 to refer to the policy communicated at purchase without printing a number of days.</p>
+          </div>
+          <div className="space-y-3">
+            {currentInvoiceTerms.map((term, index) => (
+              <div key={`invoice-term-${index}`}>
+                <div className="flex items-center justify-between mb-1">
+                  <label className="label !mb-0" htmlFor={`invoice-term-${index}`}>Term {index + 1}</label>
+                  {currentInvoiceTerms.length > 2 && (
+                    <button
+                      type="button"
+                      className="text-xs text-rose-500 hover:underline"
+                      onClick={() => setBusiness({
+                        ...business,
+                        invoiceTerms: currentInvoiceTerms.filter((_, termIndex) => termIndex !== index),
+                      })}
+                    >
+                      Remove
+                    </button>
+                  )}
+                </div>
+                <textarea
+                  id={`invoice-term-${index}`}
+                  className="input min-h-[64px]"
+                  maxLength={500}
+                  value={term}
+                  onChange={(e) => setBusiness({
+                    ...business,
+                    invoiceTerms: currentInvoiceTerms.map((value, termIndex) => termIndex === index ? e.target.value : value),
+                  })}
+                />
+              </div>
+            ))}
+          </div>
+          {currentInvoiceTerms.length < 4 && (
+            <button
+              type="button"
+              className="btn-outline text-sm mt-3"
+              onClick={() => setBusiness({
+                ...business,
+                invoiceTerms: [...currentInvoiceTerms, ""],
+              })}
+            >
+              Add a term
+            </button>
+          )}
+          <p className="text-xs text-ink-400 mt-3">Enter 2 to 4 terms (up to 500 characters each). Use <code>{"{returnPeriodDays}"}</code> to insert the configured period.</p>
         </div>
 
         {/* Appearance */}
