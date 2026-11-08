@@ -270,6 +270,82 @@ node --test tests\*.test.js
 Run the command from the `server` directory. Without the URI, MongoDB
 integration tests are skipped; a standalone MongoDB server is insufficient.
 
+#### Browser financial workflow tests
+
+The browser runner requires Node.js 20+, Docker with a locally cached `mongo:7`
+image, and an installed Chrome or Edge. On Windows it detects standard
+installation paths; set `E2E_BROWSER_PATH` to an installed Chromium executable
+when necessary. Run from the repository root:
+
+```powershell
+npm --prefix client run test:e2e
+```
+
+The runner refuses to pull an image, starts its own loopback-published disposable
+replica set, generates synthetic users and data, and stops its exact container
+afterward. It runs the real frontend against a loopback-only test server mounting
+the application financial routes, not the complete production server. The
+server does not read `server/.env`, disables external invoice messaging and
+blocks messaging/reset routes. Browser page requests outside the two test
+origins are blocked. The runner uses a clean temporary browser profile and
+deletes its temporary directory, including test artifacts, after the run. Do
+not point the tests at an existing database or use real accounts.
+
+The suite covers login, protected routes, session persistence and invalid-token
+rejection and expiry of a short-lived signed token; desktop and mobile checkout
+with cash, UPI and split tender and change; a
+discounted sale with outstanding balance; total-mismatch recovery, double
+submission, a lost response and UI retry; partial and full returns and batch
+restoration; historical fractional returns and replacements; a fractional-return
+rounding boundary; and a replacement with an additional payment. Synthetic
+historical data is created through a test-server-only endpoint requiring the
+per-run nonce, a valid synthetic user and an owned synthetic customer. Some
+replay assertions use the real API after a browser submission. Loading, empty
+and error states, dropdown positioning and modal bounds are checked at two
+viewport sizes. Other screen sizes, all payment combinations, accessibility,
+comprehensive responsive overflow and external integrations remain untested.
+Browser request interception is not an operating-system network firewall.
+
+The test server uses the production CORS configuration, JSON parser limit,
+authentication, route handlers and error middleware, with tests for preflight,
+disallowed origins, unauthorized access, tenant ownership and malformed JSON.
+It omits production request logging, restricts the route set, stubs invoice
+messaging and adds the synthetic-fixture endpoint; it does not run the complete
+production server or validate its startup, logging or external integrations.
+The existing backend suite can also be run against a fresh disposable replica
+set with `node client\e2e\run.cjs --backend`.
+An abrupt forced termination can interrupt cleanup; inspect Docker for the
+specific disposable test container before stopping it.
+
+#### Client dependency audit (Sprint 3.3.1)
+
+The initial audit reported 13 affected packages: 8 high and 5 moderate. Compatible
+lockfile updates resolved the listed package advisories as follows:
+
+| Initial package | Severity | Dependency path | Compatible version installed |
+| --- | --- | --- | --- |
+| axios | high | direct | 1.21.0 |
+| baseline-browser-mapping | moderate | autoprefixer / browserslist | 2.11.35 |
+| browserslist | high | autoprefixer | 4.29.5 |
+| follow-redirects | high | axios | 1.16.3 |
+| form-data | high | axios | 4.0.6 |
+| nanoid | high | postcss | 3.3.20 |
+| postcss | high | direct and vite / tailwindcss | 8.5.32 |
+| postcss-selector-parser | moderate | tailwindcss | 6.1.6 |
+| source-map-js | high | postcss | 1.2.2 |
+
+Four packages remain in the audit: direct development dependency Vite 5.4.21
+(high) and its esbuild 0.21.5 (moderate), plus direct react-router-dom 6.30.6
+and transitive react-router 6.30.6 (both moderate). The Vite advisories affect
+development-server file access and editor handling; esbuild can expose a dev
+server to requests from other sites. Keep development servers isolated from
+untrusted networks and browsing. The router advisories concern open redirects
+with untrusted destinations and SSR hydration; avoid untrusted navigation
+destinations. This client is not using SSR, but the client navigation risk is
+not eliminated. npm proposes Vite 8.3.6 and react-router-dom 7.18.5, both major
+upgrades requiring separate compatibility review. No forced major upgrade was
+performed. Advisory data and counts can change over time.
+
 ---
 
 ### 📄 PDF Invoices
