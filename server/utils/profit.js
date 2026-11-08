@@ -24,7 +24,29 @@ function saleProfit(sale, costMap = {}) {
   let cogs = 0;
   for (const it of sale.items || []) {
     const netQty = Math.max(0, (it.quantity || 0) - (it.returnedQty || 0));
-    cogs += unitCostFor(it, costMap) * netQty;
+    const fallbackCost = unitCostFor(it, costMap);
+    if (Array.isArray(it.batchAllocations) && it.batchAllocations.length > 0) {
+      let returned = Math.max(0, Number(it.returnedQty) || 0);
+      const legacyFirst = Math.max(0, Number(it.legacyQuantityFirst) || 0);
+      const returnedLegacyFirst = Math.min(returned, legacyFirst);
+      returned -= returnedLegacyFirst;
+      let allocated = 0;
+      for (const allocation of it.batchAllocations) {
+        const quantity = Math.max(0, Number(allocation.quantity) || 0);
+        const returnedFromBatch = Math.min(returned, quantity);
+        returned -= returnedFromBatch;
+        allocated += quantity;
+        const remainingBatchQty = quantity - returnedFromBatch;
+        const cost = allocation.costPrice == null
+          ? fallbackCost
+          : Math.max(0, Number(allocation.costPrice) || 0);
+        cogs += cost * remainingBatchQty;
+      }
+      const legacyQuantity = Math.max(0, (Number(it.quantity) || 0) - allocated);
+      cogs += fallbackCost * Math.max(0, legacyQuantity - returnedLegacyFirst - returned);
+    } else {
+      cogs += fallbackCost * netQty;
+    }
   }
   const netRevenue = round2((sale.total || 0) - (sale.returnedAmount || 0));
   const cogsR = round2(cogs);

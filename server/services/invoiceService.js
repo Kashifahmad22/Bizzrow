@@ -8,14 +8,14 @@
 const Counter = require("../models/Counter");
 const { formatInvoiceNumber } = require("../utils/invoiceFormat");
 
-async function nextInvoiceNumber(ownerId, date = new Date()) {
+async function nextInvoiceNumber(ownerId, date = new Date(), session) {
   const year = date.getFullYear();
   const key = `invoice:${ownerId}:${year}`;
   // Atomic increment (upsert) — safe under concurrent sale creation.
   const counter = await Counter.findOneAndUpdate(
     { _id: key },
     { $inc: { seq: 1 } },
-    { upsert: true, new: true }
+    { upsert: true, new: true, session }
   );
   return formatInvoiceNumber(year, counter.seq);
 }

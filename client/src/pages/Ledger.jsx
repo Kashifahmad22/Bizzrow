@@ -3,6 +3,7 @@ import { motion } from "framer-motion";
 import toast from "react-hot-toast";
 import { Plus, Search, Phone, Send, Wallet, Users, ChevronRight, IndianRupee, FileText, Download } from "lucide-react";
 import { api } from "../api/client.js";
+import { useFinancialMutation } from "../hooks/useFinancialMutation.js";
 import { useDebounce } from "../hooks/useDebounce.js";
 import { formatINR, formatDate, initials, relativeTime } from "../lib/format.js";
 import PageHeader from "../components/PageHeader.jsx";
@@ -196,7 +197,7 @@ function CustomerRow({ customer, onOpen }) {
 
 function CustomerModal({ onClose, onSaved, initial = null }) {
   const [form, setForm] = useState(
-    initial || { name: "", phone: "", shopName: "", address: "", notes: "" }
+    initial || { name: "", phone: "", shopName: "", address: "", gstNumber: "", notes: "" }
   );
   const [submitting, setSubmitting] = useState(false);
 
@@ -252,6 +253,10 @@ function CustomerModal({ onClose, onSaved, initial = null }) {
           <input className="input" value={form.address} onChange={(e) => setForm({ ...form, address: e.target.value })} placeholder="optional" />
         </div>
         <div>
+          <label className="label">GSTIN</label>
+          <input className="input" value={form.gstNumber || ""} onChange={(e) => setForm({ ...form, gstNumber: e.target.value })} placeholder="optional" />
+        </div>
+        <div>
           <label className="label">Notes</label>
           <textarea className="input min-h-[80px]" value={form.notes} onChange={(e) => setForm({ ...form, notes: e.target.value })} placeholder="optional" />
         </div>
@@ -261,9 +266,10 @@ function CustomerModal({ onClose, onSaved, initial = null }) {
 }
 
 function LedgerDrawer({ customer, onClose, onChange }) {
+  const paymentPath = `/ledger/${customer._id}/payment`;
+  const financialMutation = useFinancialMutation(paymentPath);
   const [entries, setEntries] = useState([]);
   const [loading, setLoading] = useState(true);
-  const [paying, setPaying] = useState(false);
   const [payAmount, setPayAmount] = useState("");
   const [payNote, setPayNote] = useState("");
   const [reminding, setReminding] = useState(false);
@@ -287,13 +293,21 @@ function LedgerDrawer({ customer, onClose, onChange }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [customer._id]);
 
+  const close = () => {
+    if (financialMutation.submitting || financialMutation.pending) {
+      toast.error("Retry the pending payment or discard it before closing.");
+      return;
+    }
+    onClose();
+  };
+
   const recordPayment = async (e) => {
     e.preventDefault();
     const amount = Number(payAmount);
     if (!amount || amount <= 0) return;
-    setPaying(true);
     try {
-      await api.post(`/ledger/${customer._id}/payment`, { amount, note: payNote });
+      const response = await financialMutation.submit({ amount, note: payNote });
+      if (!response) return;
       toast.success(`Recorded payment of ${formatINR(amount)}`);
       setPayAmount("");
       setPayNote("");
@@ -301,8 +315,6 @@ function LedgerDrawer({ customer, onClose, onChange }) {
       onChange();
     } catch (err) {
       toast.error(err.message);
-    } finally {
-      setPaying(false);
     }
   };
 
@@ -322,7 +334,7 @@ function LedgerDrawer({ customer, onClose, onChange }) {
     <>
     <Modal
       open
-      onClose={onClose}
+      onClose={close}
       title="Customer ledger"
       size="lg"
     >
@@ -363,12 +375,22 @@ function LedgerDrawer({ customer, onClose, onChange }) {
             placeholder="Record payment"
             value={payAmount}
             onChange={(e) => setPayAmount(e.target.value)}
+            disabled={financialMutation.pending || financialMutation.submitting}
             min="1"
           />
-          <button type="submit" className="btn-primary !py-1.5 !px-3 text-xs" disabled={paying || !payAmount}>
-            {paying ? "…" : "Record"}
+          <button type="submit" className="btn-primary !py-1.5 !px-3 text-xs" disabled={financialMutation.submitting || !payAmount}>
+            {financialMutation.submitting ? "…" : "Record"}
           </button>
         </form>
+        {financialMutation.pending && (
+          <button
+            onClick={() => { try { financialMutation.abandon(); } catch (err) { toast.error(err.message); } }}
+            disabled={financialMutation.submitting}
+            className="btn-outline justify-center"
+          >
+            Discard pending payment
+          </button>
+        )}
         <button
           onClick={sendReminder}
           disabled={currentCustomer.pendingBalance <= 0 || reminding}

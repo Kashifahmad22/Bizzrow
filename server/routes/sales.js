@@ -1,17 +1,34 @@
 const express = require("express");
 const Sale = require("../models/Sale");
 const Product = require("../models/Product");
+const StockBatch = require("../models/StockBatch");
 const Customer = require("../models/Customer");
 const LedgerEntry = require("../models/LedgerEntry");
 const asyncHandler = require("../utils/asyncHandler");
 const { protect } = require("../middleware/auth");
 const whatsapp = require("../services/whatsappService");
 const { buildInvoicePdf } = require("../services/pdfService");
+const { snapshotInvoiceTerms } = require("../utils/invoiceTerms");
 const { buildSalesFilter, resolveSaleSort } = require("../utils/salesQuery");
 const invoiceService = require("../services/invoiceService");
-const { computeSaleTotals, computeReturnSettlement, computeReplacementCredit, round2 } = require("../utils/saleMath");
+const {
+  allocateReturnItems,
+  computeSaleTotals,
+  computeReturnSettlement,
+  computeReplacementCredit,
+  normalizePaymentSplits,
+  round2,
+} = require("../utils/saleMath");
 const ReturnRecord = require("../models/ReturnRecord");
 const { clampLimit, clampPage, posInt, pageMeta } = require("../utils/validate");
+const { decrementStock, getStockRequirements } = require("../services/stockService");
+const { restoreBatchStock, returnedBatchAllocations } = require("../services/stockBatchService");
+const { salePrice, wholesalePrice, retailPrice } = require("../utils/productPricing");
+const {
+  executeIdempotently,
+  requestFingerprint,
+  requireIdempotencyKey,
+} = require("../services/financialTransaction");
 
 function httpError(status, message) {
   const e = new Error(message);
@@ -19,108 +36,190 @@ function httpError(status, message) {
   return e;
 }
 
-// Restock + adjust sale + credit ledger for a return. Returns refund + line snapshots.
-async function processReturn(sale, reqItems, ownerId) {
-  let refundTotal = 0;
-  const returnedItems = [];
-  for (const r of reqItems) {
-    const qty = posInt(r.quantity);
-    if (qty <= 0) continue;
-    const line = sale.items.find((it) => String(it.product) === String(r.productId));
-    if (!line) throw httpError(400, "Returned item is not part of this sale");
-    const returnable = (line.quantity || 0) - (line.returnedQty || 0);
-    if (qty > returnable) throw httpError(400, `Cannot return ${qty} of ${line.name} — only ${returnable} returnable`);
-    const netUnit = line.quantity > 0 ? (line.subtotal || 0) / line.quantity : 0;
-    const refund = Math.round(netUnit * qty * 100) / 100;
-    refundTotal += refund;
-    line.returnedQty = (line.returnedQty || 0) + qty;
-    returnedItems.push({ product: line.product, name: line.name, quantity: qty, unitNet: Math.round(netUnit * 100) / 100, refund });
-    const product = await Product.findOne({ _id: line.product, owner: ownerId });
-    if (product) {
-      product.stock += qty;
-      product.soldCount = Math.max(0, (product.soldCount || 0) - qty);
-      await product.save();
+function cashRefundParts(paymentParts, refundAmount) {
+  let remaining = refundAmount;
+  const refunds = [];
+  for (const payment of paymentParts) {
+    if (remaining <= 0) break;
+    const amount = round2(Math.min(payment.amount, remaining));
+    if (amount > 0) {
+      refunds.push({ method: "cash", amount, source: payment.source || "sale" });
+      remaining = round2(remaining - amount);
     }
   }
-  refundTotal = Math.round(refundTotal * 100) / 100;
+  if (remaining > 0) throw httpError(500, "Cash refund could not be reconciled to returned payments");
+  return refunds;
+}
+
+// Restock + adjust sale + customer/ledger balances for a return atomically.
+async function processReturn(sale, reqItems, ownerId, session, { replacement = false } = {}) {
+  let allocations;
+  try {
+    allocations = allocateReturnItems(sale, reqItems);
+  } catch (error) {
+    error.status = 400;
+    throw error;
+  }
+  const returnedItems = [];
+  const refundTotal = round2(allocations.reduce((sum, item) => sum + item.refund, 0));
   if (refundTotal <= 0) throw httpError(400, "Nothing to return");
 
-  // Money settlement: split the refund into "due cancelled" vs "cash refunded"
-  // so COLLECTED drops by the cash portion and the ledger only credits the
-  // outstanding portion (fixes walk-in + registered return accuracy).
-  const s = computeReturnSettlement(sale, refundTotal);
+  for (const allocation of allocations) {
+    const { item, quantity, refund, newReturnedQty } = allocation;
+    const restoredBatchAllocations = returnedBatchAllocations(item, quantity);
+    item.returnedQty = newReturnedQty;
+    returnedItems.push({
+      product: item.product,
+      name: item.name,
+      quantity,
+      unitNet: round2(refund / quantity),
+      refund,
+    });
+    const stockUpdate = await Product.updateOne(
+      { _id: item.product, owner: ownerId },
+      [
+        { $set: { stock: { $add: ["$stock", quantity] } } },
+        { $set: { soldCount: { $max: [0, { $subtract: [{ $ifNull: ["$soldCount", 0] }, quantity] }] } } },
+      ],
+      { session }
+    );
+    if (stockUpdate.matchedCount !== 1) {
+      throw httpError(409, `Cannot return ${item.name}; its product record is unavailable`);
+    }
+    try {
+      await restoreBatchStock({
+        StockBatch,
+        ownerId,
+        productId: item.product,
+        allocations: restoredBatchAllocations.allocations,
+        session,
+      });
+    } catch (error) {
+      error.message = `${error.message} for ${item.name}`;
+      throw error;
+    }
+  }
+
+  let s;
+  try {
+    s = computeReturnSettlement(sale, refundTotal);
+  } catch (error) {
+    error.status = 409;
+    throw error;
+  }
   sale.returnedAmount = s.newReturnedAmount;
   sale.payments = s.newPayments;
   sale.amountPaid = s.newAmountPaid;
+  sale.creditApplied = s.newCreditApplied;
   sale.dueAmount = s.newDueAmount;
   sale.paymentStatus = s.paymentStatus;
-  sale.paymentMethod = s.newPayments.length > 1 ? "split" : s.newPayments.length === 1 ? s.newPayments[0].method : sale.paymentMethod;
+  sale.paymentMethod = s.newCreditApplied > 0
+    ? s.newPayments.length > 0 ? "split" : "credit"
+    : s.newPayments.length > 1 ? "split"
+      : s.newPayments.length === 1 ? s.newPayments[0].method : sale.paymentMethod;
   const totalQty = sale.items.reduce((a, it) => a + (it.quantity || 0), 0);
   const returnedQ = sale.items.reduce((a, it) => a + (it.returnedQty || 0), 0);
   sale.returnStatus = returnedQ === 0 ? "none" : returnedQ >= totalQty ? "full" : "partial";
-  await sale.save();
+  await sale.save({ session });
 
   if (sale.customer) {
-    const customer = await Customer.findById(sale.customer);
-    if (customer) {
-      customer.pendingBalance = Math.round(Math.max(0, (customer.pendingBalance || 0) - s.dueReduction) * 100) / 100;
-      customer.totalPurchased = Math.round(Math.max(0, (customer.totalPurchased || 0) - refundTotal) * 100) / 100;
-      customer.totalPaid = Math.round(Math.max(0, (customer.totalPaid || 0) - s.cashRefund) * 100) / 100;
-      await customer.save();
-      // Ledger reflects the BALANCE change only (the due cancelled). A pure cash
-      // refund (dueReduction === 0) doesn't change the balance, so skip the row.
-      if (s.dueReduction > 0) {
-        await LedgerEntry.create({
-          owner: ownerId,
-          customer: customer._id,
-          type: "return",
-          amount: -s.dueReduction,
-          balanceAfter: customer.pendingBalance,
-          reference: sale._id,
-          note: `Return on ${sale.invoiceNumber}${s.cashRefund > 0 ? ` (₹${s.cashRefund} cash refund)` : ""}`,
-        });
-      }
+    const customer = await Customer.findOne({ _id: sale.customer, owner: ownerId }).session(session);
+    if (!customer) throw httpError(409, "Cannot return this sale because its customer record is missing");
+    const customerBalance = round2(customer.pendingBalance || 0);
+    if (s.dueReduction > customerBalance) {
+      throw httpError(409, "Customer balance is inconsistent with this sale's outstanding amount");
+    }
+    customer.pendingBalance = round2(customerBalance - s.dueReduction);
+    customer.totalPurchased = Math.round(Math.max(0, (customer.totalPurchased || 0) - refundTotal) * 100) / 100;
+    customer.totalPaid = Math.round(Math.max(0, (customer.totalPaid || 0) - s.paidRefund) * 100) / 100;
+    await customer.save({ session });
+    if (s.dueReduction > 0) {
+      await LedgerEntry.create([{
+        owner: ownerId,
+        customer: customer._id,
+        type: "return",
+        amount: -s.dueReduction,
+        balanceAfter: customer.pendingBalance,
+        reference: sale._id,
+        note: `Return on ${sale.invoiceNumber}`,
+      }], { session });
     }
   }
-  return { refundTotal, returnedItems, cashRefund: s.cashRefund, dueReduction: s.dueReduction };
+  const cashRefund = replacement ? s.creditRefund : round2(s.paidRefund + s.creditRefund);
+  const refundPayments = replacement
+    ? (s.creditRefund > 0 ? [{ method: "cash", amount: s.creditRefund, source: "credit" }] : [])
+    : [...s.paidRefundPayments, ...(s.creditRefund > 0 ? [{ method: "cash", amount: s.creditRefund, source: "credit" }] : [])];
+  return {
+    refundTotal,
+    returnedItems,
+    cashRefund,
+    creditToReplacement: replacement ? s.paidRefund : 0,
+    dueReduction: s.dueReduction,
+    paidRefund: s.paidRefund,
+    paidRefundPayments: s.paidRefundPayments,
+    creditRefund: s.creditRefund,
+    refundPayments,
+  };
 }
 
-// Create a sale from resolved line items (used by replacement). Mirrors POST /sales create.
-async function createSaleFromItems({ ownerId, customer, customerName, customerType, items, payments = [], billDiscount = {}, replacementOf = null, carryCredit = 0, user }) {
+// Create a replacement sale with credit recorded separately from collected payments.
+async function createSaleFromItems({ ownerId, customer, customerName, customerType, items, payments = [], billDiscount = {}, saleType = "wholesale", replacementOf = null, carryCredit = 0, business = {}, session }) {
   const rawItems = [];
   for (const it of items) {
-    const product = await Product.findOne({ _id: it.productId, owner: ownerId });
+    const product = await Product.findOne({ _id: it.productId, owner: ownerId }).session(session);
     if (!product) throw httpError(404, `Product not found: ${it.productId}`);
     const qty = posInt(it.quantity);
     if (qty <= 0) throw httpError(400, `Invalid quantity for ${product.name}`);
-    if (product.stock < qty) throw httpError(400, `Insufficient stock for ${product.name} (have ${product.stock}, need ${qty})`);
     rawItems.push({
       product: product._id,
       name: product.name,
+      sku: product.sku || "",
+      unit: product.unit || "",
       size: product.size,
       color: product.color,
       quantity: qty,
-      unitPrice: Number(it.unitPrice ?? product.sellingPrice),
+      unitPrice: salePrice(product, saleType),
+      wholesalePrice: wholesalePrice(product),
+      retailPrice: retailPrice(product),
       costPrice: Number(product.costPrice) || 0,
       discountType: it.discountType === "percent" ? "percent" : "amount",
       discountValue: Number(it.discountValue) || 0,
     });
   }
   const computed = computeSaleTotals({ items: rawItems, billDiscount });
-  // Replacement carry-over: apply already-paid value from the returned sale as a
-  // "credit" payment so a cash-neutral swap never leaves the customer wrongly owing.
-  const extraPaid = payments.reduce((a, p) => a + (Number(p.amount) || 0), 0);
-  const { carriedCredit } = computeReplacementCredit({ cashRefund: carryCredit, replacementTotal: computed.total, extraPaid });
-  const effPayments = carriedCredit > 0 ? [...payments, { method: "credit", amount: carriedCredit }] : payments;
-  const paid = Math.min(effPayments.reduce((a, p) => a + (Number(p.amount) || 0), 0), computed.total);
-  const due = Math.round((computed.total - paid) * 100) / 100;
-  const summaryMethod = effPayments.length > 1 ? "split" : effPayments.length === 1 ? effPayments[0].method : "cash";
-  const invoiceNumber = await invoiceService.nextInvoiceNumber(ownerId);
-  const sale = await Sale.create({
+  let normalizedPayments;
+  try {
+    normalizedPayments = normalizePaymentSplits(payments, computed.total);
+  } catch (error) {
+    error.status = 400;
+    throw error;
+  }
+  const extraPaid = normalizedPayments.reduce((sum, payment) => sum + payment.amount, 0);
+  const { carriedCredit, cashReturned } = computeReplacementCredit({
+    cashRefund: carryCredit,
+    replacementTotal: computed.total,
+    extraPaid,
+  });
+  const paid = round2(extraPaid);
+  const due = round2(computed.total - paid - carriedCredit);
+  const summaryMethod = carriedCredit > 0 && normalizedPayments.length > 0
+    ? "split"
+    : carriedCredit > 0 ? "credit"
+      : normalizedPayments.length > 1 ? "split"
+        : normalizedPayments.length === 1 ? normalizedPayments[0].method : "cash";
+  const invoiceNumber = await invoiceService.nextInvoiceNumber(ownerId, new Date(), session);
+  const collectedAt = new Date();
+  await decrementStock({ Product, StockBatch, items: computed.items, ownerId, session });
+  const [sale] = await Sale.create([{
     owner: ownerId,
     customer: customer ? customer._id : null,
     customerName,
+    customerPhoneSnapshot: customer?.phone || "",
+    customerShopNameSnapshot: customer?.shopName || "",
+    customerAddressSnapshot: customer?.address || "",
+    customerGstNumberSnapshot: customer?.gstNumber || "",
     customerType,
+    saleType,
     items: computed.items,
     subtotal: computed.subtotal,
     itemDiscountTotal: computed.itemDiscountTotal,
@@ -129,47 +228,84 @@ async function createSaleFromItems({ ownerId, customer, customerName, customerTy
     billDiscountAmount: computed.billDiscountAmount,
     totalDiscount: computed.totalDiscount,
     total: computed.total,
-    payments: effPayments,
+    payments: normalizedPayments.map((payment) => ({ ...payment, source: "sale", collectedAt })),
+    collectionPayments: normalizedPayments.map((payment) => ({ ...payment, source: "sale", collectedAt })),
     amountPaid: paid,
+    creditApplied: carriedCredit,
+    creditSources: carriedCredit > 0 && replacementOf ? [{ sale: replacementOf, amount: carriedCredit }] : [],
     dueAmount: due,
     paymentMethod: summaryMethod,
     paymentStatus: due === 0 ? "paid" : paid > 0 ? "partial" : "unpaid",
     invoiceNumber,
+    ...snapshotInvoiceTerms(business),
     replacementOf,
-  });
-  for (const it of computed.items) {
-    await Product.updateOne({ _id: it.product, owner: ownerId }, { $inc: { stock: -it.quantity, soldCount: it.quantity } });
-  }
+  }], { session });
   if (customer) {
-    customer.pendingBalance += due;
-    customer.totalPurchased += computed.total;
-    customer.totalPaid += paid;
+    const previousBalance = customer.pendingBalance || 0;
+    customer.pendingBalance = round2(previousBalance + due);
+    customer.totalPurchased = round2((customer.totalPurchased || 0) + computed.total);
+    customer.totalPaid = round2((customer.totalPaid || 0) + paid);
     customer.lastPurchaseAt = new Date();
-    await customer.save();
-    await LedgerEntry.create({ owner: ownerId, customer: customer._id, type: "sale", amount: computed.total, balanceAfter: customer.pendingBalance, reference: sale._id, note: `Replacement ${sale.invoiceNumber}` });
-    if (paid > 0) await LedgerEntry.create({ owner: ownerId, customer: customer._id, type: "payment", amount: -paid, balanceAfter: customer.pendingBalance, reference: sale._id, note: `Payment for ${sale.invoiceNumber} (${summaryMethod})` });
+    await customer.save({ session });
+    const entries = [{
+      owner: ownerId,
+      customer: customer._id,
+      type: "sale",
+      amount: computed.total,
+      balanceAfter: round2(previousBalance + computed.total),
+      reference: sale._id,
+      note: `Replacement ${sale.invoiceNumber}`,
+    }];
+    if (paid > 0) entries.push({
+      owner: ownerId,
+      customer: customer._id,
+      type: "payment",
+      amount: -paid,
+      balanceAfter: round2(previousBalance + computed.total - paid),
+      reference: sale._id,
+      collectionSource: "sale",
+      paymentMethod: normalizedPayments.length > 1 ? "split" : normalizedPayments[0].method,
+      note: `Payment for ${sale.invoiceNumber}`,
+    });
+    if (carriedCredit > 0) entries.push({
+      owner: ownerId,
+      customer: customer._id,
+      type: "adjustment",
+      amount: -carriedCredit,
+      balanceAfter: customer.pendingBalance,
+      reference: sale._id,
+      collectionSource: "credit",
+      note: `Replacement credit applied to ${sale.invoiceNumber}`,
+    });
+    await LedgerEntry.create(entries, { session, ordered: true });
   }
-  return { sale, total: computed.total, paid };
+  return { sale, total: computed.total, paid, carriedCredit, cashReturned };
 }
 
 const router = express.Router();
 router.use(protect);
 
-// Normalize the split-payment array; tolerate the legacy { amountPaid, paymentMethod } shape.
-function normalizePayments(body) {
-  let payments = [];
+// Normalize split tender while retaining the legacy { amountPaid, paymentMethod } shape.
+function normalizePayments(body, maximum) {
+  let requested;
   if (Array.isArray(body.payments)) {
-    payments = body.payments
-      .map((p) => ({ method: p.method, amount: Number(p.amount) || 0 }))
-      .filter((p) => p.amount > 0 && p.method);
-  } else if (body.amountPaid != null) {
-    const amt = Number(body.amountPaid) || 0;
-    if (amt > 0) payments = [{ method: body.paymentMethod || "cash", amount: amt }];
+    requested = body.payments;
+  } else if (body.amountPaid != null && Number(body.amountPaid) !== 0) {
+    requested = [{ method: body.paymentMethod || "cash", amount: body.amountPaid }];
+  } else {
+    requested = [];
   }
-  const amountPaid = payments.reduce((a, p) => a + p.amount, 0);
-  const summaryMethod =
-    payments.length > 1 ? "split" : payments.length === 1 ? payments[0].method : "cash";
-  return { payments, amountPaid, summaryMethod };
+  try {
+    const payments = normalizePaymentSplits(requested, maximum);
+    const amountPaid = round2(payments.reduce((sum, payment) => sum + payment.amount, 0));
+    const summaryMethod = payments.length > 1
+      ? "split"
+      : payments.length === 1 ? payments[0].method : "cash";
+    return { payments, amountPaid, summaryMethod };
+  } catch (error) {
+    error.status = 400;
+    throw error;
+  }
 }
 
 // GET /api/sales — optional filters (all backward compatible; no params = latest 200)
@@ -210,169 +346,187 @@ router.get(
 router.post(
   "/",
   asyncHandler(async (req, res) => {
-    const { items, notes = "" } = req.body;
-    const customerType = req.body.customerType || "existing";
-    if (!Array.isArray(items) || items.length === 0) {
-      res.status(400);
-      throw new Error("At least one item is required");
-    }
+    const key = requireIdempotencyKey(req);
+    const fingerprint = requestFingerprint("sale:create", {}, req.body);
+    const result = await executeIdempotently({
+      ownerId: req.user._id,
+      operation: "sale-create",
+      key,
+      fingerprint,
+      work: async (session) => {
+        const { items, notes = "" } = req.body;
+        const customerType = req.body.customerType || "existing";
+        const saleType = req.body.saleType || "wholesale";
+        if (!["wholesale", "retail"].includes(saleType)) {
+          throw httpError(400, "Sale type must be wholesale or retail");
+        }
+        if (!Array.isArray(items) || items.length === 0) {
+          throw httpError(400, "At least one item is required");
+        }
 
-    // --- Resolve customer based on type ---
-    let customer = null;
-    let customerName = "Walk-in Customer";
+        let customer = null;
+        let customerName = "Walk-in Customer";
+        if (customerType === "walkin") {
+          customerName = req.body.walkInName?.trim() || "Walk-in Customer";
+        } else if (customerType === "new") {
+          const nc = req.body.newCustomer || {};
+          if (!nc.name || !nc.phone) throw httpError(400, "New customer needs a name and phone");
+          customer = await Customer.findOne({ owner: req.user._id, phone: nc.phone }).session(session);
+          if (!customer) {
+            [customer] = await Customer.create([{
+              owner: req.user._id,
+              name: nc.name,
+              phone: nc.phone,
+              shopName: nc.shopName || "",
+              address: nc.address || "",
+              gstNumber: nc.gstNumber || "",
+            }], { session });
+          }
+          customerName = customer.name;
+        } else if (customerType === "existing") {
+          customer = await Customer.findOne({ _id: req.body.customerId, owner: req.user._id }).session(session);
+          if (!customer) throw httpError(404, "Customer not found");
+          customerName = customer.name;
+        } else {
+          throw httpError(400, "Invalid customer type");
+        }
 
-    if (customerType === "walkin") {
-      customer = null;
-      customerName = req.body.walkInName?.trim() || "Walk-in Customer";
-    } else if (customerType === "new") {
-      const nc = req.body.newCustomer || {};
-      if (!nc.name || !nc.phone) {
-        res.status(400);
-        throw new Error("New customer needs a name and phone");
-      }
-      // Reuse an existing customer with the same phone if present, else create.
-      customer = await Customer.findOne({ owner: req.user._id, phone: nc.phone });
-      if (!customer) {
-        customer = await Customer.create({
+        const rawItems = [];
+        const products = new Map();
+        for (const item of items) {
+          const productId = String(item.productId || "");
+          let product = products.get(productId);
+          if (!product) {
+            product = await Product.findOne({ _id: productId, owner: req.user._id }).session(session);
+            if (!product) throw httpError(404, `Product not found: ${item.productId}`);
+            products.set(productId, product);
+          }
+          const quantity = Number(item.quantity);
+          if (!Number.isFinite(quantity) || quantity <= 0) {
+            throw httpError(400, `Invalid quantity for product ${product.name}`);
+          }
+          rawItems.push({
+            product: product._id,
+            name: product.name,
+            sku: product.sku || "",
+            unit: product.unit || "",
+            size: product.size,
+            color: product.color,
+            wholesalePrice: wholesalePrice(product),
+            retailPrice: retailPrice(product),
+            quantity,
+            unitPrice: req.body.saleType
+              ? salePrice(product, saleType)
+              : Number(item.unitPrice ?? wholesalePrice(product)),
+            costPrice: Number(product.costPrice) || 0,
+            discountType: item.discountType === "percent" ? "percent" : "amount",
+            discountValue: Number(item.discountValue) || 0,
+          });
+        }
+
+        for (const [productId, quantity] of getStockRequirements(rawItems)) {
+          const product = products.get(productId);
+          if (product.stock < quantity) {
+            throw httpError(400, `Insufficient stock for ${product.name} (have ${product.stock}, need ${quantity})`);
+          }
+        }
+
+        const computed = computeSaleTotals({ items: rawItems, billDiscount: req.body.billDiscount });
+        const { payments, amountPaid: paid, summaryMethod } = normalizePayments(req.body, computed.total);
+        const due = round2(computed.total - paid);
+        if (customerType === "walkin" && due > 0) {
+          throw httpError(400, "Walk-in sales must be fully paid (no ledger to track a balance).");
+        }
+        const paymentStatus = due === 0 ? "paid" : paid > 0 ? "partial" : "unpaid";
+        const invoiceNumber = await invoiceService.nextInvoiceNumber(req.user._id, new Date(), session);
+        const collectedAt = new Date();
+        await decrementStock({ Product, StockBatch, items: computed.items, ownerId: req.user._id, session });
+        const [sale] = await Sale.create([{
           owner: req.user._id,
-          name: nc.name,
-          phone: nc.phone,
-          shopName: nc.shopName || "",
-        });
-      }
-      customerName = customer.name;
-    } else {
-      // existing
-      customer = await Customer.findOne({ _id: req.body.customerId, owner: req.user._id });
-      if (!customer) {
-        res.status(404);
-        throw new Error("Customer not found");
-      }
-      customerName = customer.name;
-    }
+          customer: customer ? customer._id : null,
+          customerName,
+          customerPhoneSnapshot: customer?.phone || "",
+          customerShopNameSnapshot: customer?.shopName || "",
+          customerAddressSnapshot: customer?.address || "",
+          customerGstNumberSnapshot: customer?.gstNumber || "",
+          customerType,
+          saleType,
+          items: computed.items,
+          subtotal: computed.subtotal,
+          itemDiscountTotal: computed.itemDiscountTotal,
+          billDiscountType: computed.billDiscountType,
+          billDiscountValue: computed.billDiscountValue,
+          billDiscountAmount: computed.billDiscountAmount,
+          totalDiscount: computed.totalDiscount,
+          total: computed.total,
+          payments: payments.map((payment) => ({ ...payment, source: "sale", collectedAt })),
+          collectionPayments: payments.map((payment) => ({ ...payment, source: "sale", collectedAt })),
+          amountPaid: paid,
+          dueAmount: due,
+          paymentMethod: summaryMethod,
+          paymentStatus,
+          invoiceNumber,
+          ...snapshotInvoiceTerms(req.user.business),
+          notes,
+        }], { session });
 
-    // --- Build snapshot items + validate stock ---
-    const rawItems = [];
-    for (const it of items) {
-      const product = await Product.findOne({ _id: it.productId, owner: req.user._id });
-      if (!product) {
-        res.status(404);
-        throw new Error(`Product not found: ${it.productId}`);
-      }
-      const qty = Number(it.quantity || 0);
-      if (qty <= 0) {
-        res.status(400);
-        throw new Error(`Invalid quantity for product ${product.name}`);
-      }
-      if (product.stock < qty) {
-        res.status(400);
-        throw new Error(`Insufficient stock for ${product.name} (have ${product.stock}, need ${qty})`);
-      }
-      rawItems.push({
-        product: product._id,
-        name: product.name,
-        size: product.size,
-        color: product.color,
-        quantity: qty,
-        unitPrice: Number(it.unitPrice ?? product.sellingPrice),
-        costPrice: Number(product.costPrice) || 0, // snapshot for profit engine
-        discountType: it.discountType === "percent" ? "percent" : "amount",
-        discountValue: Number(it.discountValue) || 0,
-      });
-    }
+        if (customer) {
+          const previousBalance = customer.pendingBalance || 0;
+          customer.pendingBalance = round2(previousBalance + due);
+          customer.totalPurchased = round2((customer.totalPurchased || 0) + computed.total);
+          customer.totalPaid = round2((customer.totalPaid || 0) + paid);
+          customer.lastPurchaseAt = new Date();
+          await customer.save({ session });
 
-    // --- Discount engine: item + bill discounts -> final totals ---
-    const computed = computeSaleTotals({ items: rawItems, billDiscount: req.body.billDiscount });
-    const expandedItems = computed.items;
-    const total = computed.total;
-
-    // --- Payments ---
-    const { payments, amountPaid, summaryMethod } = normalizePayments(req.body);
-    const paid = Math.min(amountPaid, total);
-    const due = Number((total - paid).toFixed(2));
-    const paymentStatus = due === 0 ? "paid" : paid > 0 ? "partial" : "unpaid";
-
-    // Walk-ins create no ledger, so they cannot carry a due balance.
-    if (customerType === "walkin" && due > 0) {
-      res.status(400);
-      throw new Error("Walk-in sales must be fully paid (no ledger to track a balance).");
-    }
-
-    // --- Persist sale (sequential BZR-YYYY-###### invoice number) ---
-    const invoiceNumber = await invoiceService.nextInvoiceNumber(req.user._id);
-    const sale = await Sale.create({
-      owner: req.user._id,
-      customer: customer ? customer._id : null,
-      customerName,
-      customerType,
-      items: expandedItems,
-      subtotal: computed.subtotal,
-      itemDiscountTotal: computed.itemDiscountTotal,
-      billDiscountType: computed.billDiscountType,
-      billDiscountValue: computed.billDiscountValue,
-      billDiscountAmount: computed.billDiscountAmount,
-      totalDiscount: computed.totalDiscount,
-      total,
-      payments,
-      amountPaid: paid,
-      dueAmount: due,
-      paymentMethod: summaryMethod,
-      paymentStatus,
-      invoiceNumber,
-      notes,
+          const entries = [{
+            owner: req.user._id,
+            customer: customer._id,
+            type: "sale",
+            amount: computed.total,
+            balanceAfter: round2(previousBalance + computed.total),
+            reference: sale._id,
+            note: `Sale ${sale.invoiceNumber}`,
+          }];
+          if (paid > 0) entries.push({
+            owner: req.user._id,
+            customer: customer._id,
+            type: "payment",
+            amount: -paid,
+            balanceAfter: round2(previousBalance + computed.total - paid),
+            reference: sale._id,
+            collectionSource: "sale",
+            paymentMethod: summaryMethod,
+            note: `Payment for ${sale.invoiceNumber}`,
+          });
+          await LedgerEntry.create(entries, { session, ordered: true });
+        }
+        return {
+          resultType: "sale",
+          resultId: sale._id,
+          value: { sale, customer, created: true },
+        };
+      },
+      replay: async (record) => {
+        const sale = await Sale.findOne({ _id: record.resultId, owner: req.user._id });
+        if (!sale) throw new Error("Idempotent sale record references a missing sale");
+        const customer = sale.customer ? await Customer.findOne({ _id: sale.customer, owner: req.user._id }) : null;
+        return { sale, customer, created: false };
+      },
     });
 
-    // --- Decrement stock + soldCount (always) ---
-    for (const it of expandedItems) {
-      await Product.updateOne(
-        { _id: it.product, owner: req.user._id },
-        { $inc: { stock: -it.quantity, soldCount: it.quantity } }
-      );
-    }
-
-    // --- Ledger + customer balance (skip for walk-ins) ---
-    if (customer) {
-      customer.pendingBalance += due;
-      customer.totalPurchased += total;
-      customer.totalPaid += paid;
-      customer.lastPurchaseAt = new Date();
-      await customer.save();
-
-      await LedgerEntry.create({
-        owner: req.user._id,
-        customer: customer._id,
-        type: "sale",
-        amount: total,
-        balanceAfter: customer.pendingBalance,
-        reference: sale._id,
-        note: `Sale ${sale.invoiceNumber}`,
-      });
-      if (paid > 0) {
-        await LedgerEntry.create({
-          owner: req.user._id,
-          customer: customer._id,
-          type: "payment",
-          amount: -paid,
-          balanceAfter: customer.pendingBalance,
-          reference: sale._id,
-          note: `Payment for ${sale.invoiceNumber} (${summaryMethod})`,
-        });
-      }
-    }
-
-    // --- WhatsApp invoice (only when we have a customer with a phone) ---
+    // Send notifications after the financial transaction commits.
     let whatsappResult = null;
-    if (customer && req.user.preferences?.whatsappAutoInvoice !== false) {
+    if (result.created && result.customer && req.user.preferences?.whatsappAutoInvoice !== false) {
       whatsappResult = await whatsapp.sendInvoice({
         owner: req.user._id,
-        customer,
-        sale,
+        customer: result.customer,
+        sale: result.sale,
         businessName: req.user.business?.name,
         upiQr: req.user.business?.upiQr,
       });
     }
 
-    res.status(201).json({ sale, whatsapp: whatsappResult });
+    res.status(result.created ? 201 : 200).json({ sale: result.sale, whatsapp: whatsappResult });
   })
 );
 
@@ -385,24 +539,34 @@ router.get(
       res.status(404);
       throw new Error("Sale not found");
     }
-    let customerPhone = "";
+    let customer = {};
     if (sale.customer) {
-      const c = await Customer.findById(sale.customer);
-      customerPhone = c?.phone || "";
+      customer = await Customer.findOne({ _id: sale.customer, owner: req.user._id }) || {};
     }
+    const returnHistory = await ReturnRecord.find({ owner: req.user._id, sale: sale._id }).sort({ createdAt: 1 }).lean();
     res.json({
       invoice: {
         saleId: sale._id,
         invoiceNumber: sale.invoiceNumber,
         date: sale.createdAt,
-        business: req.user.business,
+        business: { ...req.user.business?.toObject?.() ?? req.user.business, email: req.user.email },
+        invoiceTerms: sale.invoiceTermsSnapshot || [],
+        invoiceReturnPeriodDays: sale.invoiceReturnPeriodDaysSnapshot,
         customer: sale.customerName,
         customerId: sale.customer,
-        customerPhone,
+        customerPhone: sale.customerPhoneSnapshot || customer.phone || "",
+        customerAddress: sale.customerAddressSnapshot || customer?.address || "",
+        customerShopName: sale.customerShopNameSnapshot || customer?.shopName || "",
+        customerGstNumber: sale.customerGstNumberSnapshot || customer?.gstNumber || customer?.gstin || "",
+        returnHistory,
         customerType: sale.customerType,
+        saleType: sale.saleType || "wholesale",
         items: sale.items,
+        taxBreakdown: sale.taxBreakdown || [],
         subtotal: sale.subtotal || sale.total, // legacy sales: subtotal == total
         itemDiscountTotal: sale.itemDiscountTotal || 0,
+        billDiscountType: sale.billDiscountType || "amount",
+        billDiscountValue: sale.billDiscountValue || 0,
         billDiscountAmount: sale.billDiscountAmount || 0,
         totalDiscount: sale.totalDiscount || 0,
         total: sale.total,
@@ -411,6 +575,7 @@ router.get(
         returnStatus: sale.returnStatus || "none",
         payments: sale.payments,
         amountPaid: sale.amountPaid,
+        creditApplied: sale.creditApplied || 0,
         dueAmount: sale.dueAmount,
         paymentStatus: sale.paymentStatus,
         paymentMethod: sale.paymentMethod,
@@ -424,29 +589,54 @@ router.get(
 router.post(
   "/:id/return",
   asyncHandler(async (req, res) => {
-    const sale = await Sale.findOne({ _id: req.params.id, owner: req.user._id });
-    if (!sale) {
-      res.status(404);
-      throw new Error("Sale not found");
-    }
-    const reqItems = Array.isArray(req.body.items) ? req.body.items : [];
-    if (reqItems.length === 0) {
-      res.status(400);
-      throw new Error("Select at least one item to return");
-    }
-    const { refundTotal, returnedItems } = await processReturn(sale, reqItems, req.user._id);
-    const record = await ReturnRecord.create({
-      owner: req.user._id,
-      sale: sale._id,
-      customer: sale.customer,
-      invoiceNumber: sale.invoiceNumber,
-      type: "return",
-      items: returnedItems,
-      refundAmount: refundTotal,
-      reason: String(req.body.reason || "").slice(0, 200),
-      notes: String(req.body.notes || "").slice(0, 500),
+    const key = requireIdempotencyKey(req);
+    const fingerprint = requestFingerprint("sale:return", { saleId: req.params.id }, req.body);
+    const result = await executeIdempotently({
+      ownerId: req.user._id,
+      operation: `sale-return:${req.params.id}`,
+      key,
+      fingerprint,
+      work: async (session) => {
+        const sale = await Sale.findOne({ _id: req.params.id, owner: req.user._id }).session(session);
+        if (!sale) throw httpError(404, "Sale not found");
+        const reqItems = Array.isArray(req.body.items) ? req.body.items : [];
+        if (reqItems.length === 0) throw httpError(400, "Select at least one item to return");
+        const settlement = await processReturn(sale, reqItems, req.user._id, session);
+        const [record] = await ReturnRecord.create([{
+          owner: req.user._id,
+          sale: sale._id,
+          customer: sale.customer,
+          invoiceNumber: sale.invoiceNumber,
+          type: "return",
+          items: settlement.returnedItems,
+          refundAmount: settlement.refundTotal,
+          cashRefund: settlement.cashRefund,
+          cashRefundFromCredit: settlement.creditRefund,
+          cashRefundFromLedger: round2(settlement.refundPayments
+            .filter((payment) => payment.source === "ledger")
+            .reduce((sum, payment) => sum + payment.amount, 0)),
+          creditApplied: 0,
+          refundPayments: settlement.refundPayments,
+          reason: String(req.body.reason || "").slice(0, 200),
+          notes: String(req.body.notes || "").slice(0, 500),
+        }], { session });
+        return {
+          resultType: "return",
+          resultId: record._id,
+          relatedResourceId: sale._id,
+          value: { ok: true, refund: settlement.refundTotal, sale, record },
+        };
+      },
+      replay: async (record) => {
+        const [sale, returnRecord] = await Promise.all([
+          Sale.findOne({ _id: record.relatedResourceId, owner: req.user._id }),
+          ReturnRecord.findOne({ _id: record.resultId, owner: req.user._id }),
+        ]);
+        if (!sale || !returnRecord) throw new Error("Idempotent return record references missing resources");
+        return { ok: true, refund: returnRecord.refundAmount, sale, record: returnRecord };
+      },
     });
-    res.json({ ok: true, refund: refundTotal, sale, record });
+    res.json(result);
   })
 );
 
@@ -455,61 +645,109 @@ router.post(
 router.post(
   "/:id/replace",
   asyncHandler(async (req, res) => {
-    const sale = await Sale.findOne({ _id: req.params.id, owner: req.user._id });
-    if (!sale) {
-      res.status(404);
-      throw new Error("Sale not found");
-    }
-    const returnItems = Array.isArray(req.body.returnItems) ? req.body.returnItems : [];
-    const newItems = Array.isArray(req.body.newItems) ? req.body.newItems : [];
-    if (returnItems.length === 0 || newItems.length === 0) {
-      res.status(400);
-      throw new Error("Replacement needs both items to return and replacement items");
-    }
-    if (sale.customerType === "walkin") {
-      res.status(400);
-      throw new Error("Replacement is not available for walk-in sales");
-    }
-
-    // 1) Return the old items. cashRefund = already-paid value freed up by the return.
-    const { refundTotal, returnedItems, cashRefund } = await processReturn(sale, returnItems, req.user._id);
-
-    // 2) Create the replacement sale, carrying the freed-up cash as credit so the swap
-    //    is cash-neutral (customer only settles a positive difference; lower swaps refund
-    //    the excess). debits ledger by its total + records payment/credit.
-    const customer = sale.customer ? await Customer.findById(sale.customer) : null;
-    const payments = (Array.isArray(req.body.payments) ? req.body.payments : [])
-      .map((p) => ({ method: p.method, amount: Number(p.amount) || 0 }))
-      .filter((p) => p.amount > 0 && p.method);
-    const { sale: newSale, total: replacementAmount } = await createSaleFromItems({
+    const key = requireIdempotencyKey(req);
+    const fingerprint = requestFingerprint("sale:replace", { saleId: req.params.id }, req.body);
+    const result = await executeIdempotently({
       ownerId: req.user._id,
-      customer,
-      customerName: sale.customerName,
-      customerType: customer ? "existing" : "walkin",
-      items: newItems,
-      payments,
-      billDiscount: req.body.billDiscount,
-      replacementOf: sale._id,
-      carryCredit: cashRefund,
-      user: req.user,
-    });
+      operation: `sale-replace:${req.params.id}`,
+      key,
+      fingerprint,
+      work: async (session) => {
+        const sale = await Sale.findOne({ _id: req.params.id, owner: req.user._id }).session(session);
+        if (!sale) throw httpError(404, "Sale not found");
+        const returnItems = Array.isArray(req.body.returnItems) ? req.body.returnItems : [];
+        const newItems = Array.isArray(req.body.newItems) ? req.body.newItems : [];
+        if (returnItems.length === 0 || newItems.length === 0) {
+          throw httpError(400, "Replacement needs both items to return and replacement items");
+        }
+        if (sale.customerType === "walkin") {
+          throw httpError(400, "Replacement is not available for walk-in sales");
+        }
+        if (req.body.payments != null && !Array.isArray(req.body.payments)) {
+          throw httpError(400, "Payments must be an array");
+        }
 
-    const priceDifference = Math.round((replacementAmount - refundTotal) * 100) / 100;
-    const record = await ReturnRecord.create({
-      owner: req.user._id,
-      sale: sale._id,
-      customer: sale.customer,
-      invoiceNumber: sale.invoiceNumber,
-      type: "replacement",
-      items: returnedItems,
-      refundAmount: refundTotal,
-      replacementSale: newSale._id,
-      replacementAmount,
-      priceDifference,
-      reason: String(req.body.reason || "").slice(0, 200),
-      notes: String(req.body.notes || "").slice(0, 500),
+        const settlement = await processReturn(sale, returnItems, req.user._id, session, { replacement: true });
+        const customer = sale.customer
+          ? await Customer.findOne({ _id: sale.customer, owner: req.user._id }).session(session)
+          : null;
+        const created = await createSaleFromItems({
+          ownerId: req.user._id,
+          customer,
+          customerName: sale.customerName,
+          customerType: customer ? "existing" : "walkin",
+          items: newItems,
+          payments: req.body.payments || [],
+          billDiscount: req.body.billDiscount,
+          saleType: sale.saleType || "wholesale",
+          replacementOf: sale._id,
+          carryCredit: settlement.creditToReplacement,
+          business: req.user.business,
+          session,
+        });
+
+        const priceDifference = round2(created.total - settlement.refundTotal);
+        const refundPayments = [
+          ...settlement.refundPayments,
+          ...cashRefundParts(settlement.paidRefundPayments, created.cashReturned),
+        ];
+        const cashRefund = round2(settlement.cashRefund + created.cashReturned);
+        const [record] = await ReturnRecord.create([{
+          owner: req.user._id,
+          sale: sale._id,
+          customer: sale.customer,
+          invoiceNumber: sale.invoiceNumber,
+          type: "replacement",
+          items: settlement.returnedItems,
+          refundAmount: settlement.refundTotal,
+          cashRefund,
+          cashRefundFromCredit: settlement.creditRefund,
+          cashRefundFromLedger: round2(refundPayments
+            .filter((payment) => payment.source === "ledger")
+            .reduce((sum, payment) => sum + payment.amount, 0)),
+          creditApplied: created.carriedCredit,
+          refundPayments,
+          replacementSale: created.sale._id,
+          replacementAmount: created.total,
+          priceDifference,
+          reason: String(req.body.reason || "").slice(0, 200),
+          notes: String(req.body.notes || "").slice(0, 500),
+        }], { session });
+        return {
+          resultType: "replacement",
+          resultId: record._id,
+          relatedResourceId: created.sale._id,
+          value: {
+            ok: true,
+            refund: settlement.refundTotal,
+            replacementAmount: created.total,
+            priceDifference,
+            sale,
+            newSale: created.sale,
+            record,
+          },
+        };
+      },
+      replay: async (record) => {
+        const [returnRecord, newSale] = await Promise.all([
+          ReturnRecord.findOne({ _id: record.resultId, owner: req.user._id }),
+          Sale.findOne({ _id: record.relatedResourceId, owner: req.user._id }),
+        ]);
+        if (!returnRecord || !newSale) throw new Error("Idempotent replacement references missing resources");
+        const sale = await Sale.findOne({ _id: returnRecord.sale, owner: req.user._id });
+        if (!sale) throw new Error("Idempotent replacement references a missing original sale");
+        return {
+          ok: true,
+          refund: returnRecord.refundAmount,
+          replacementAmount: returnRecord.replacementAmount,
+          priceDifference: returnRecord.priceDifference,
+          sale,
+          newSale,
+          record: returnRecord,
+        };
+      },
     });
-    res.json({ ok: true, refund: refundTotal, replacementAmount, priceDifference, sale, newSale, record });
+    res.json(result);
   })
 );
 
@@ -526,16 +764,31 @@ router.get(
 router.get(
   "/:id/invoice/pdf",
   asyncHandler(async (req, res) => {
+    const format = req.query.format || "a4";
+    if (!["a4", "thermal80", "thermal58"].includes(format)) {
+      res.status(400);
+      throw new Error("Invoice format must be a4, thermal80, or thermal58.");
+    }
     const sale = await Sale.findOne({ _id: req.params.id, owner: req.user._id });
     if (!sale) {
       res.status(404);
       throw new Error("Sale not found");
     }
     let customer = {};
-    if (sale.customer) customer = (await Customer.findById(sale.customer)) || {};
-    const pdf = await buildInvoicePdf(sale, req.user.business || {}, customer);
+    if (sale.customer) customer = (await Customer.findOne({ _id: sale.customer, owner: req.user._id })) || {};
+    const business = { ...req.user.business?.toObject?.() ?? req.user.business, email: req.user.email };
+    const returnHistory = await ReturnRecord.find({ owner: req.user._id, sale: sale._id }).sort({ createdAt: 1 }).lean();
+    const invoiceCustomer = {
+      ...customer?.toObject?.() ?? customer,
+      name: sale.customerName,
+      phone: sale.customerPhoneSnapshot || customer?.phone || "",
+      shopName: sale.customerShopNameSnapshot || customer?.shopName || "",
+      address: sale.customerAddressSnapshot || customer?.address || "",
+      gstNumber: sale.customerGstNumberSnapshot || customer?.gstNumber || customer?.gstin || "",
+    };
+    const pdf = await buildInvoicePdf({ ...sale.toObject(), returnHistory }, business, invoiceCustomer, { format });
     res.setHeader("Content-Type", "application/pdf");
-    res.setHeader("Content-Disposition", `attachment; filename="Invoice-${sale.invoiceNumber}.pdf"`);
+    res.setHeader("Content-Disposition", `attachment; filename="Invoice-${sale.invoiceNumber}-${format}.pdf"`);
     res.send(pdf);
   })
 );
@@ -553,12 +806,22 @@ router.post(
       res.status(400);
       throw new Error("Walk-in sales have no customer to message");
     }
-    const customer = await Customer.findById(sale.customer);
+    const customer = await Customer.findOne({ _id: sale.customer, owner: req.user._id });
     if (!customer || !customer.phone) {
       res.status(400);
       throw new Error("Customer has no phone number on file");
     }
-    const pdfBuffer = await buildInvoicePdf(sale, req.user.business || {}, customer);
+    const business = { ...req.user.business?.toObject?.() ?? req.user.business, email: req.user.email };
+    const returnHistory = await ReturnRecord.find({ owner: req.user._id, sale: sale._id }).sort({ createdAt: 1 }).lean();
+    const invoiceCustomer = {
+      ...customer.toObject(),
+      name: sale.customerName,
+      phone: sale.customerPhoneSnapshot || customer.phone,
+      shopName: sale.customerShopNameSnapshot || customer.shopName,
+      address: sale.customerAddressSnapshot || customer.address,
+      gstNumber: sale.customerGstNumberSnapshot || customer.gstNumber,
+    };
+    const pdfBuffer = await buildInvoicePdf({ ...sale.toObject(), returnHistory }, business, invoiceCustomer, { format: "a4" });
     const result = await whatsapp.sendInvoice({
       owner: req.user._id,
       customer,

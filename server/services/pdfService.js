@@ -1,7 +1,7 @@
 /**
  * PDF invoice generator (pdfkit).
  *
- * buildInvoicePdf(sale, business, customer) -> Promise<Buffer>
+ * buildInvoicePdf(sale, business, customer, options) -> Promise<Buffer>
  *
  * Note on currency: pdfkit's built-in Helvetica (WinAnsi) has no glyph for the
  * ₹ rupee sign, so the PDF uses an ASCII "Rs." prefix to guarantee clean
@@ -9,6 +9,7 @@
  */
 
 const PDFDocument = require("pdfkit");
+const { buildInvoicePdfDocument } = require("./invoicePdf");
 
 const INK = "#161a2b";
 const MUTED = "#7a8198";
@@ -31,128 +32,8 @@ function logoBuffer(dataUrl) {
   }
 }
 
-function buildInvoicePdf(sale, business = {}, customer = {}) {
-  return new Promise((resolve, reject) => {
-    try {
-      const doc = new PDFDocument({ size: "A4", margin: 50 });
-      const chunks = [];
-      doc.on("data", (c) => chunks.push(c));
-      doc.on("end", () => resolve(Buffer.concat(chunks)));
-      doc.on("error", reject);
-
-      const pageLeft = 50;
-      const pageRight = 545;
-      const brandName = business.name || "Bizzrow";
-
-      // ---- Header ----
-      const logo = logoBuffer(business.logo);
-      let headerTextX = pageLeft;
-      if (logo) {
-        try {
-          doc.image(logo, pageLeft, 50, { fit: [56, 56] });
-          headerTextX = pageLeft + 70;
-        } catch {
-          headerTextX = pageLeft;
-        }
-      }
-      doc.fillColor(INK).font("Helvetica-Bold").fontSize(20).text(brandName, headerTextX, 54);
-      doc.font("Helvetica").fontSize(9).fillColor(MUTED);
-      const contactLines = [];
-      if (business.address) contactLines.push(business.address);
-      const line2 = [business.phone ? `Phone: ${business.phone}` : null, business.gstNumber ? `GST: ${business.gstNumber}` : null]
-        .filter(Boolean)
-        .join("   ");
-      if (line2) contactLines.push(line2);
-      if (business.upiId) contactLines.push(`UPI: ${business.upiId}`);
-      doc.text(contactLines.join("\n"), headerTextX, 78, { width: 300 });
-
-      // Invoice label (right aligned)
-      doc.fillColor(BRAND).font("Helvetica-Bold").fontSize(22).text("INVOICE", pageRight - 160, 54, { width: 160, align: "right" });
-      doc.fillColor(MUTED).font("Helvetica").fontSize(9);
-      doc.text(`Invoice #: ${sale.invoiceNumber}`, pageRight - 200, 84, { width: 200, align: "right" });
-      doc.text(`Date: ${new Date(sale.createdAt || Date.now()).toLocaleDateString("en-IN", { day: "numeric", month: "short", year: "numeric" })}`, pageRight - 200, 98, { width: 200, align: "right" });
-
-      // Divider
-      doc.moveTo(pageLeft, 124).lineTo(pageRight, 124).strokeColor(LINE).lineWidth(1).stroke();
-
-      // ---- Bill to ----
-      doc.fillColor(MUTED).font("Helvetica-Bold").fontSize(8).text("BILL TO", pageLeft, 140);
-      doc.fillColor(INK).font("Helvetica-Bold").fontSize(12).text(sale.customerName || "Walk-in Customer", pageLeft, 154);
-      doc.font("Helvetica").fontSize(9).fillColor(MUTED);
-      if (customer && customer.phone) doc.text(customer.phone, pageLeft, 172);
-      if (customer && customer.shopName) doc.text(customer.shopName, pageLeft, 185);
-      if (sale.customerType === "walkin") doc.text("Walk-in (no ledger account)", pageLeft, customer && customer.phone ? 185 : 172);
-
-      // ---- Items table ----
-      let y = 220;
-      const cols = { item: pageLeft, qty: 330, rate: 400, amount: 470 };
-      doc.fillColor(INK).font("Helvetica-Bold").fontSize(9);
-      doc.text("ITEM", cols.item, y);
-      doc.text("QTY", cols.qty, y, { width: 50, align: "right" });
-      doc.text("RATE", cols.rate, y, { width: 60, align: "right" });
-      doc.text("AMOUNT", cols.amount, y, { width: 75, align: "right" });
-      y += 16;
-      doc.moveTo(pageLeft, y).lineTo(pageRight, y).strokeColor(LINE).lineWidth(1).stroke();
-      y += 8;
-
-      doc.font("Helvetica").fontSize(10);
-      (sale.items || []).forEach((it) => {
-        const meta = [it.color, it.size].filter(Boolean).join(" · ");
-        const discLabel =
-          it.discountAmount > 0
-            ? `Disc ${it.discountType === "percent" ? `${it.discountValue}%` : rupee(it.discountValue)} (−${rupee(it.discountAmount)})`
-            : "";
-        const note = [meta, discLabel].filter(Boolean).join("   ·   ");
-        doc.fillColor(INK).fontSize(10).text(it.name, cols.item, y, { width: 270 });
-        const nameHeight = doc.heightOfString(it.name, { width: 270 });
-        if (note) {
-          doc.fillColor(MUTED).fontSize(8).text(note, cols.item, y + nameHeight, { width: 270 });
-          doc.fontSize(10);
-        }
-        doc.fillColor(INK);
-        doc.text(String(it.quantity), cols.qty, y, { width: 50, align: "right" });
-        doc.text(rupee(it.unitPrice), cols.rate, y, { width: 60, align: "right" });
-        doc.text(rupee(it.subtotal), cols.amount, y, { width: 75, align: "right" });
-        y += Math.max(nameHeight, 14) + (note ? 12 : 6) + 6;
-      });
-
-      // ---- Totals ----
-      y += 6;
-      doc.moveTo(320, y).lineTo(pageRight, y).strokeColor(LINE).lineWidth(1).stroke();
-      y += 10;
-      const totalRow = (label, value, opts = {}) => {
-        doc.font(opts.bold ? "Helvetica-Bold" : "Helvetica").fontSize(opts.bold ? 12 : 10);
-        doc.fillColor(opts.color || INK);
-        doc.text(label, 320, y, { width: 120 });
-        doc.text(value, cols.amount, y, { width: 75, align: "right" });
-        y += opts.bold ? 20 : 16;
-      };
-      if ((sale.totalDiscount || 0) > 0) {
-        totalRow("Subtotal", rupee(sale.subtotal || sale.total));
-        totalRow("Discount", `- ${rupee(sale.totalDiscount)}`, { color: "#0f9d58" });
-      }
-      totalRow("Total", rupee(sale.total), { bold: true });
-
-      // Payment breakdown
-      if (Array.isArray(sale.payments) && sale.payments.length > 0) {
-        const labelMap = { cash: "Cash", upi: "UPI", bank: "Bank", card: "Card", credit: "Credit" };
-        sale.payments.forEach((p) => totalRow(labelMap[p.method] || p.method, rupee(p.amount)));
-      }
-      totalRow("Paid", rupee(sale.amountPaid), { color: "#0f9d58" });
-      totalRow("Due", rupee(sale.dueAmount), { bold: true, color: sale.dueAmount > 0 ? "#d93025" : "#0f9d58" });
-
-      // ---- Footer ----
-      const footerY = 770;
-      doc.moveTo(pageLeft, footerY).lineTo(pageRight, footerY).strokeColor(LINE).lineWidth(1).stroke();
-      doc.fillColor(MUTED).font("Helvetica").fontSize(8);
-      doc.text("Thank you for your business.", pageLeft, footerY + 8);
-      doc.fillColor(BRAND).font("Helvetica-Bold").text("Generated by Bizzrow", pageLeft, footerY + 8, { width: pageRight - pageLeft, align: "right" });
-
-      doc.end();
-    } catch (err) {
-      reject(err);
-    }
-  });
+function buildInvoicePdf(sale, business = {}, customer = {}, options = {}) {
+  return buildInvoicePdfDocument(sale, business, customer, options);
 }
 
 /**

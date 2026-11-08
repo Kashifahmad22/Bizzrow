@@ -268,6 +268,7 @@ function KpiDetailModal({ metric, onClose }) {
         </div>
       ) : metric === "collection" ? (
         <div>
+          {data.historicalIncomplete && <p className="text-xs text-amber-700 mb-3">Historical collections may be incomplete because older transactions lack original payment snapshots.</p>}
           <div className="flex items-center justify-between mb-3">
             <span className="text-sm text-ink-500">Total collected in range</span>
             <span className="font-display font-extrabold text-lg text-ink-900">{formatINR(data.total)}</span>
@@ -622,6 +623,7 @@ function CollectionCard({ collection }) {
   return (
     <div className="card">
       <h2 className="font-display font-bold text-lg text-ink-900 mb-1">Collection</h2>
+      {collection?.historicalIncomplete && <p className="text-xs text-amber-700 mb-2">Historical collections may be incomplete because older transactions lack original payment snapshots.</p>}
       <p className="text-xs text-ink-500 mb-3">Today by method</p>
 
       {/* Today's collection breakdown */}

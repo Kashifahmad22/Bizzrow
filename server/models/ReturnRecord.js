@@ -1,5 +1,14 @@
 const mongoose = require("mongoose");
 
+const refundPaymentSchema = new mongoose.Schema(
+  {
+    method: { type: String, enum: ["cash", "upi", "bank", "card"], required: true },
+    amount: { type: Number, required: true, min: 0 },
+    source: { type: String, enum: ["sale", "ledger", "credit"], default: "sale" },
+  },
+  { _id: false }
+);
+
 // Audit trail for returns and replacements (Final RC — Phase C).
 // One record per return/replacement event, linked to the original sale.
 const returnItemSchema = new mongoose.Schema(
@@ -22,6 +31,11 @@ const returnRecordSchema = new mongoose.Schema(
     type: { type: String, enum: ["return", "replacement"], default: "return" },
     items: { type: [returnItemSchema], default: [] },
     refundAmount: { type: Number, default: 0 }, // value of returned goods
+    cashRefund: { type: Number, default: 0, min: 0 },
+    cashRefundFromCredit: { type: Number, default: 0, min: 0 },
+    cashRefundFromLedger: { type: Number, default: 0, min: 0 },
+    creditApplied: { type: Number, default: 0, min: 0 },
+    refundPayments: { type: [refundPaymentSchema], default: [] },
     reason: { type: String, default: "" },
     notes: { type: String, default: "" },
     // Replacement-only:

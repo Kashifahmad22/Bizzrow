@@ -7,6 +7,7 @@ const customerSchema = new mongoose.Schema(
     phone: { type: String, required: true, trim: true }, // expect +91XXXXXXXXXX
     shopName: { type: String, default: "" },
     address: { type: String, default: "" },
+    gstNumber: { type: String, default: "" },
     pendingBalance: { type: Number, default: 0 }, // positive = customer owes us
     totalPaid: { type: Number, default: 0 },
     totalPurchased: { type: Number, default: 0 },

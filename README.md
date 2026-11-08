@@ -76,13 +76,32 @@ Bizzrow aims to remove it.
 * Inventory Valuation
 * Stock Visibility
 * Product Categorization
+* Separate wholesale and retail prices; legacy selling prices remain wholesale prices
+* Optional cost price when supplier cost is unknown
+* Complete tenant-scoped inventory CSV export and exact-match duplicate review
+* Purchase batches with FIFO sale deduction, batch cost snapshots, and batch-aware returns
+
+The Products page exports the complete tenant catalog (independent of the current
+search, filters, and pagination) as a date-stamped CSV. Duplicate review reports
+exact SKU/barcode matches and exact name + size + colour matches; it never merges
+or edits records.
+
+New stock purchases can be recorded as dated batches from a product card.
+Batch creation and aggregate stock updates are transactional. Sales consume
+available batches FIFO and save the allocations with the sale; returns restore
+the originally allocated batch stock. Existing product stock is shown as
+legacy/unbatched stock and is not assigned invented dates or costs. Initial
+product/import stock remains unbatched, and historical sales/returns without
+saved batch allocations continue using the existing aggregate-stock behavior.
 
 ---
 
 ### 💰 Sales Management
 
 * Fast Checkout
+* Retail / wholesale sale mode with snapshotted prices
 * Product Search
+* Direct quantity entry and flat / percentage discounts
 * Customer Search
 * Sales History
 * Walk-In Customer Support
@@ -124,6 +143,26 @@ Due ₹1000
 * Inventory Restoration
 * Ledger Updates
 * Collection Adjustments
+
+Financial write endpoints (`POST /api/sales`, sale returns/replacements, and
+`POST /api/ledger/:customerId/payment`) require an `Idempotency-Key` header
+(8–200 characters). Retrying the same key and payload replays the prior result;
+reusing a key with a different payload returns a conflict. Clients that omit the
+header receive a 400 response. Sale payments accept
+cash, UPI, bank, and card splits only, and the total collected cannot exceed the
+sale total or customer's outstanding balance. Ledger payments are allocated to
+the customer's oldest outstanding sales. Replacement carry-forward is tracked
+separately from tender, so it is not counted as a collection. Returns allocate
+bill discounts proportionately across line items and quantities.
+
+The web client persists the pending key per tab and endpoint, reuses it only for
+the same request payload, and keeps failed transaction forms available for retry.
+To start a changed request after a failure, explicitly discard the pending
+attempt first.
+
+These financial writes require a MongoDB replica set or sharded cluster with
+transaction support. The API returns an error rather than writing partially if
+transactions are unavailable.
 
 ---
 
@@ -250,6 +289,15 @@ npm install
 npm run dev
 ```
 
+For local development, set `NODE_ENV=development` and
+`CLIENT_ORIGIN=http://localhost:5173` in the backend environment. Set
+`VITE_API_URL=http://localhost:5000/api` in `client/.env.local`, or leave it
+unset to use the frontend's local-backend default. The API listens on port 5000
+by default. Local CORS explicitly allows Vite at `localhost:5173` and
+`127.0.0.1:5173`; the production allowlist remains controlled by
+`CLIENT_ORIGIN`. If you run Vite on a different local origin, add it to
+`CLIENT_ORIGINS` as a comma-separated list while in development.
+
 ### Frontend
 
 ```bash
@@ -257,6 +305,29 @@ cd client
 npm install
 npm run dev
 ```
+
+Open the frontend at `http://localhost:5173` so its browser origin matches the
+local configuration.
+
+### Product pricing migration
+
+The migration script is read-only by default and reports how many legacy products
+need wholesale, retail, or missing-cost values normalized. From the `server`
+directory, run:
+
+```bash
+node scripts/migrateProductPricing.js
+```
+
+Review the dry-run output and ensure a database backup is available before
+applying the changes explicitly:
+
+```bash
+node scripts/migrateProductPricing.js --apply
+```
+
+The script uses `MONGO_URI` from the server environment. It does not change stock
+or sales records; the legacy `sellingPrice` field remains the wholesale alias.
 
 ---
 
@@ -273,6 +344,9 @@ WHATSAPP_PHONE_NUMBER_ID=
 SMTP_HOST=
 SMTP_USER=
 SMTP_PASS=
+# Development only: explicitly allow returning a reset link when SMTP is unavailable.
+# NODE_ENV must be exactly "development" for this option to take effect.
+EXPOSE_DEV_RESET_LINK=false
 ```
 
 ### Frontend

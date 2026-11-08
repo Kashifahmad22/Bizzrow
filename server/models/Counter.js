@@ -9,6 +9,10 @@ const counterSchema = new mongoose.Schema(
   {
     _id: { type: String },
     seq: { type: Number, default: 0 },
+    requestHash: { type: String, default: "" },
+    resultType: { type: String, default: "" },
+    resultId: { type: mongoose.Schema.Types.ObjectId, default: null },
+    relatedResourceId: { type: mongoose.Schema.Types.ObjectId, default: null },
   },
   { versionKey: false }
 );

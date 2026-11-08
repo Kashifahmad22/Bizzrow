@@ -5,6 +5,7 @@ const morgan = require("morgan");
 
 const connectDB = require("./config/db");
 const { notFound, errorHandler } = require("./middleware/error");
+const { createCorsOptions } = require("./utils/corsConfig");
 
 const authRoutes = require("./routes/auth");
 const productRoutes = require("./routes/products");
@@ -20,12 +21,7 @@ const settingsRoutes = require("./routes/settings");
 const app = express();
 
 // --- Core middleware ---
-app.use(
-  cors({
-    origin: process.env.CLIENT_ORIGIN || "http://localhost:5173",
-    credentials: true,
-  })
-);
+app.use(cors(createCorsOptions()));
 // Generous JSON limit to accommodate base64 images (product, logo, UPI QR, OCR invoice uploads)
 app.use(express.json({ limit: "8mb" }));
 app.use(morgan("dev"));
@@ -52,12 +48,13 @@ app.use(notFound);
 app.use(errorHandler);
 
 const PORT = process.env.PORT || 5000;
+const HOST = process.env.NODE_ENV === "production" ? undefined : "127.0.0.1";
 
 connectDB()
   .then(() => {
-    app.listen(PORT, () => {
+    app.listen(PORT, HOST, () => {
       // eslint-disable-next-line no-console
-      console.log(`✓ Bizzrow API listening on http://localhost:${PORT}`);
+      console.log(`✓ Bizzrow API listening on http://${HOST || "localhost"}:${PORT}`);
     });
   })
   .catch((err) => {

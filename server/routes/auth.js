@@ -4,6 +4,7 @@ const jwt = require("jsonwebtoken");
 const User = require("../models/User");
 const asyncHandler = require("../utils/asyncHandler");
 const { protect } = require("../middleware/auth");
+const { shouldExposeDevelopmentResetLink } = require("../utils/resetLinkPolicy");
 const mailer = require("../services/mailer");
 
 const router = express.Router();
@@ -13,8 +14,8 @@ function hashToken(raw) {
   return crypto.createHash("sha256").update(String(raw)).digest("hex");
 }
 
-function signToken(userId) {
-  return jwt.sign({ id: userId }, process.env.JWT_SECRET, {
+function signToken(userId, tokenVersion = 0) {
+  return jwt.sign({ id: userId, tokenVersion }, process.env.JWT_SECRET, {
     expiresIn: process.env.JWT_EXPIRES_IN || "7d",
   });
 }
@@ -54,7 +55,7 @@ router.post(
       password,
       business: { name: businessName || `${name}'s Shop` },
     });
-    res.status(201).json({ token: signToken(user._id), user: publicUser(user) });
+    res.status(201).json({ token: signToken(user._id, user.tokenVersion), user: publicUser(user) });
   })
 );
 
@@ -72,7 +73,7 @@ router.post(
     res.status(401);
     throw new Error("Invalid credentials");
   }
-  res.json({ token: signToken(user._id), user: publicUser(user) });
+  res.json({ token: signToken(user._id, user.tokenVersion), user: publicUser(user) });
 })
 );
 
@@ -112,15 +113,14 @@ router.post(
       if (mailer.isConfigured()) {
         await mailer.sendResetEmail({ to: user.email, link, businessName: user.business?.name });
       } else {
-        // SMTP not configured — log the link so the flow still works in dev/staging.
         // eslint-disable-next-line no-console
-        console.log(`[forgot-password] SMTP not configured. Reset link for ${user.email}: ${link}`);
-        if (process.env.NODE_ENV !== "production") resp.devLink = link;
+        console.warn("[forgot-password] SMTP is not configured; reset email was not sent.");
+        if (shouldExposeDevelopmentResetLink()) resp.devLink = link;
       }
     } catch (err) {
       // eslint-disable-next-line no-console
       console.error("[forgot-password] email send failed:", err.message);
-      if (process.env.NODE_ENV !== "production") resp.devLink = link;
+      if (shouldExposeDevelopmentResetLink()) resp.devLink = link;
     }
     res.json(resp);
   })
@@ -150,9 +150,10 @@ router.post(
     user.password = password; // pre-save hook re-hashes
     user.resetTokenHash = ""; // one-time use
     user.resetTokenExpiresAt = undefined;
+    user.tokenVersion = (user.tokenVersion || 0) + 1;
     await user.save();
     // Auto-login on success.
-    res.json({ token: signToken(user._id), user: publicUser(user) });
+    res.json({ token: signToken(user._id, user.tokenVersion), user: publicUser(user) });
   })
 );
 

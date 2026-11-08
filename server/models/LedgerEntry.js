@@ -14,6 +14,8 @@ const ledgerEntrySchema = new mongoose.Schema(
     amount: { type: Number, required: true },
     balanceAfter: { type: Number, required: true },
     reference: { type: mongoose.Schema.Types.ObjectId },
+    collectionSource: { type: String, enum: ["sale", "ledger", "credit"], default: "sale" },
+    paymentMethod: { type: String, enum: ["cash", "upi", "bank", "card", "split"], default: null },
     note: { type: String, default: "" },
   },
   { timestamps: true }
