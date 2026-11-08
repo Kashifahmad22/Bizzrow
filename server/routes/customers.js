@@ -2,6 +2,7 @@ const express = require("express");
 const Customer = require("../models/Customer");
 const asyncHandler = require("../utils/asyncHandler");
 const { protect } = require("../middleware/auth");
+const { customerId, customerPhone } = require("../utils/customerInput");
 const { buildTextFilter } = require("../utils/search");
 const { clampLimit, clampPage, pageMeta } = require("../utils/validate");
 const { round2 } = require("../utils/saleMath");
@@ -12,6 +13,14 @@ const { runFinancialTransaction } = require("../services/financialTransaction");
 
 const router = express.Router();
 router.use(protect);
+router.param("id", (req, res, next, value) => {
+  try {
+    req.params.id = customerId(value);
+    next();
+  } catch (error) {
+    next(error);
+  }
+});
 
 // GET /api/customers?q=&page=&limit=
 // Returns a page of customers + a portfolio `summary` (totals stay correct even
@@ -53,7 +62,7 @@ router.post(
       const customer = await Customer.create({
         owner: req.user._id,
         name,
-        phone,
+        phone: customerPhone(phone),
         shopName,
         address,
         gstNumber,
@@ -80,7 +89,7 @@ router.put(
       throw new Error("Customer not found");
     }
     const fields = ["name", "phone", "shopName", "address", "gstNumber", "notes"];
-    for (const f of fields) if (f in req.body) customer[f] = req.body[f];
+    for (const f of fields) if (f in req.body) customer[f] = f === "phone" ? customerPhone(req.body[f]) : req.body[f];
     await customer.save();
     res.json({ customer });
   })

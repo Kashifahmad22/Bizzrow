@@ -27,7 +27,7 @@ async function main() {
   app.use(cors(createCorsOptions()));
   app.use(express.json({ limit: "8mb" }));
   const allowed = [
-    ["POST", /^\/api\/auth\/(register|login)$/],
+    ["POST", /^\/api\/auth\/(register|login|logout)$/],
     ["GET", /^\/api\/auth\/me$/],
     ["GET", /^\/api\/(customers|products|sales)$/],
     ["POST", /^\/api\/(customers|products|sales)$/],
@@ -35,6 +35,9 @@ async function main() {
     ["GET", /^\/api\/ledger\/[a-f0-9]{24}$/],
     ["GET", /^\/api\/products\/[a-f0-9]{24}\/batches$/],
     ["POST", /^\/api\/products\/[a-f0-9]{24}\/batches$/],
+    ["GET", /^\/api\/inventory-audits(\/[a-f0-9]{24})?$/],
+    ["POST", /^\/api\/inventory-audits(\/[a-f0-9]{24}\/approve)?$/],
+    ["PUT", /^\/api\/inventory-audits\/[a-f0-9]{24}$/],
     ["GET", /^\/api\/sales\/[a-f0-9]{24}(\/(invoice|returns))?$/],
     ["POST", /^\/api\/sales\/[a-f0-9]{24}\/(return|replace)$/],
   ];
@@ -69,7 +72,11 @@ async function main() {
       next(error);
     }
   });
-  for (const name of ["auth", "products", "customers", "ledger", "sales", "dashboard"]) {
+  for (const name of ["auth", "products", "customers", "ledger", "sales", "dashboard", "inventory-audits"]) {
+    if (name === "inventory-audits") {
+      app.use("/api/inventory-audits", require("../../server/routes/inventoryAudits"));
+      continue;
+    }
     app.use(`/api/${name}`, require(`../../server/routes/${name}`));
   }
   app.get("/health", (_req, res) => res.json({ nonce: process.env.E2E_NONCE }));

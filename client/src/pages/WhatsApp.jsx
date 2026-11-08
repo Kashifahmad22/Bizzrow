@@ -12,6 +12,7 @@ export default function WhatsAppPage() {
   const { user, refreshUser } = useAuth();
   const [logs, setLogs] = useState([]);
   const [customers, setCustomers] = useState([]);
+  const [totalCustomers, setTotalCustomers] = useState(0);
   const [loading, setLoading] = useState(true);
   const [body, setBody] = useState("");
   const [selected, setSelected] = useState(new Set());
@@ -31,6 +32,7 @@ export default function WhatsAppPage() {
       const [l, c] = await Promise.all([api.get("/whatsapp/logs"), api.get("/customers")]);
       setLogs(l.data.logs);
       setCustomers(c.data.customers);
+      setTotalCustomers(c.data.total);
     } catch (err) {
       toast.error(err.message);
     } finally {
@@ -42,7 +44,7 @@ export default function WhatsAppPage() {
     load();
   }, []);
 
-  const recipientCount = allCustomers ? customers.length : selected.size;
+  const recipientCount = allCustomers ? totalCustomers : selected.size;
   const preview = useMemo(() => body.replace(/\{name\}/gi, "Rahul"), [body]);
 
   // Infer connection state from the most recent log.
@@ -64,8 +66,7 @@ export default function WhatsAppPage() {
   const doSend = async () => {
     setSending(true);
     try {
-      const payload = { body };
-      if (!allCustomers && selected.size > 0) payload.customerIds = [...selected];
+      const payload = allCustomers ? { body, allCustomers: true } : { body, customerIds: [...selected] };
       const { data } = await api.post("/whatsapp/broadcast", payload);
       setConfirmOpen(false);
       if (data.sent > 0 && data.failed === 0) toast.success(`Sent to ${data.sent} customer${data.sent === 1 ? "" : "s"}`);
@@ -178,7 +179,7 @@ export default function WhatsAppPage() {
                   onClick={() => { setAllCustomers(true); setSelected(new Set()); }}
                   className={`text-xs px-3 py-1 rounded-full font-semibold ${allCustomers ? "bg-brand-500 text-white" : "bg-ink-100 text-ink-600"}`}
                 >
-                  All ({customers.length})
+                  All ({totalCustomers})
                 </button>
                 <button
                   onClick={() => setAllCustomers(false)}

@@ -10,7 +10,7 @@ const { buildTextFilter } = require("../utils/search");
 const ai = require("../services/aiService");
 const { normalizeExtraction } = require("../utils/ocrNormalize");
 const { clampLimit, clampPage, pageMeta } = require("../utils/validate");
-const { normalizeProductPrices, serializeProduct } = require("../utils/productPricing");
+const { normalizeProductPrices, serializeProduct, validateCurrency } = require("../utils/productPricing");
 const { buildProductCsv, inventoryFilename } = require("../utils/productExport");
 const { detectProductDuplicates } = require("../utils/productDuplicates");
 const { deleteUnusedProduct, isValidProductId } = require("../services/productDeletion");
@@ -145,10 +145,7 @@ router.post(
         if (!Number.isFinite(purchaseDate.getTime())) {
           throw Object.assign(new Error("purchaseDate must be a valid date"), { status: 400 });
         }
-        const costPrice = req.body.costPrice == null || req.body.costPrice === "" ? null : Number(req.body.costPrice);
-        if (costPrice != null && (!Number.isFinite(costPrice) || costPrice < 0)) {
-          throw Object.assign(new Error("costPrice must be a non-negative number"), { status: 400 });
-        }
+        const costPrice = req.body.costPrice == null || req.body.costPrice === "" ? null : validateCurrency(req.body.costPrice, "costPrice");
         const batchCode = String(req.body.batchCode || makeBatchCode(purchaseDate)).trim();
         if (!batchCode || batchCode.length > 60) {
           throw Object.assign(new Error("batchCode must contain 1 to 60 characters"), { status: 400 });
@@ -207,12 +204,7 @@ router.post(
     for (const f of PRODUCT_FIELDS) if (f in req.body) payload[f] = req.body[f];
     Object.assign(payload, normalizeProductPrices(req.body, { creating: true }));
     if (costPrice != null) {
-      const parsedCost = Number(costPrice);
-      if (!Number.isFinite(parsedCost) || parsedCost < 0) {
-        res.status(400);
-        throw new Error("costPrice must be a non-negative number");
-      }
-      payload.costPrice = parsedCost;
+      payload.costPrice = validateCurrency(costPrice, "costPrice");
     } else {
       payload.costPrice = null;
     }
@@ -239,14 +231,12 @@ router.put(
       if (["sellingPrice", "wholesalePrice", "retailPrice", "stock"].includes(f)) continue;
       if (f in req.body) product[f] = req.body[f];
     }
-    Object.assign(product, normalizeProductPrices(req.body));
+    Object.assign(product, normalizeProductPrices(req.body, { current: product }));
     if ("costPrice" in req.body) {
-      const cost = req.body.costPrice == null || req.body.costPrice === "" ? null : Number(req.body.costPrice);
-      if (cost != null && (!Number.isFinite(cost) || cost < 0)) {
-        res.status(400);
-        throw new Error("costPrice must be a non-negative number");
-      }
-      product.costPrice = cost;
+      const cost = req.body.costPrice;
+      if (cost == null || cost === "") product.costPrice = null;
+      else if (!(product.costPrice != null && (typeof cost === "number" || typeof cost === "string")
+        && Number(cost) === product.costPrice)) product.costPrice = validateCurrency(cost, "costPrice");
     }
     await product.save();
     res.json({ product: serializeProduct(product) });
@@ -335,9 +325,7 @@ router.post(
       if (p.costPrice == null || p.costPrice === "") {
         doc.costPrice = null;
       } else {
-        const cost = Number(p.costPrice);
-        if (!Number.isFinite(cost) || cost < 0) continue;
-        doc.costPrice = cost;
+        doc.costPrice = validateCurrency(p.costPrice, "costPrice");
       }
       doc.stock = validateNewQuantity(p.stock ?? 0, { allowZero: true });
       docs.push(doc);

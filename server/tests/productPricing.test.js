@@ -8,6 +8,7 @@ const {
   initialSalePrice,
   normalizeProductPrices,
   serializeProduct,
+  validateCurrency,
 } = require("../utils/productPricing");
 
 test("legacy selling price remains the wholesale price with a 2x retail fallback", () => {
@@ -59,6 +60,23 @@ test("product price normalization preserves legacy input and defaults retail on 
 test("invalid pricing modes and negative prices are rejected", () => {
   assert.throws(() => salePrice({ sellingPrice: 10 }, "bulk"), /Sale type must be wholesale or retail/);
   assert.throws(() => normalizeProductPrices({ wholesalePrice: -1 }), /non-negative number/);
+});
+
+test("new product and batch currency inputs use the payment precision policy", () => {
+  assert.equal(validateCurrency("12.34", "costPrice"), 12.34);
+  assert.equal(validateCurrency(0, "costPrice"), 0);
+  for (const value of ["1.005", -1, {}, [], "1e2"]) {
+    assert.throws(() => validateCurrency(value, "costPrice"), { status: 400 });
+    assert.throws(() => normalizeProductPrices({ sellingPrice: value }, { creating: true }), { status: 400 });
+  }
+  assert.throws(() => normalizeProductPrices({ sellingPrice: 1, retailPrice: 1.005 }), { status: 400 });
+});
+
+test("unchanged historical prices survive product edits without allowing new extra precision", () => {
+  const current = { sellingPrice: 1.234, wholesalePrice: 1.234, retailPrice: 2.468 };
+  assert.deepEqual(normalizeProductPrices({ sellingPrice: "1.234", retailPrice: 2.468 }, { current }),
+    { sellingPrice: 1.234, wholesalePrice: 1.234, retailPrice: 2.468 });
+  assert.throws(() => normalizeProductPrices({ sellingPrice: 1.235 }, { current }), { status: 400 });
 });
 
 test("unknown cost does not report a fabricated margin", () => {

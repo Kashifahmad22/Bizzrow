@@ -6,6 +6,7 @@ const Customer = require("../models/Customer");
 const LedgerEntry = require("../models/LedgerEntry");
 const asyncHandler = require("../utils/asyncHandler");
 const { protect } = require("../middleware/auth");
+const { customerId: validateCustomerId, customerPhone } = require("../utils/customerInput");
 const whatsapp = require("../services/whatsappService");
 const { buildInvoicePdf } = require("../services/pdfService");
 const { snapshotInvoiceTerms } = require("../utils/invoiceTerms");
@@ -146,7 +147,7 @@ async function processReturn(sale, reqItems, ownerId, session, { replacement = f
       { $set: {
         stock: quantityMath.add(product.stock, quantity),
         soldCount: Math.max(0, quantityMath.subtract(product.soldCount || 0, quantity)),
-      } },
+      }, $inc: { stockRevision: 1 } },
       { session }
     );
     if (stockUpdate.matchedCount !== 1) {
@@ -373,7 +374,7 @@ router.get(
   "/",
   asyncHandler(async (req, res) => {
     const { q, status, customerId, from, to, sort } = req.query;
-    const filter = buildSalesFilter({ ownerId: req.user._id, q, status, customerId, from, to });
+    const filter = buildSalesFilter({ ownerId: req.user._id, q, status, customerId: customerId == null ? undefined : validateCustomerId(customerId), from, to });
     const page = clampPage(req.query.page);
     const limit = clampLimit(req.query.limit, 25, 100);
     const [sales, total] = await Promise.all([
@@ -434,12 +435,13 @@ router.post(
         } else if (customerType === "new") {
           const nc = req.body.newCustomer || {};
           if (!nc.name || !nc.phone) throw httpError(400, "New customer needs a name and phone");
-          customer = await Customer.findOne({ owner: req.user._id, phone: nc.phone }).session(session);
+          const phone = customerPhone(nc.phone);
+          customer = await Customer.findOne({ owner: req.user._id, phone }).session(session);
           if (!customer) {
             newCustomer = {
               owner: req.user._id,
               name: nc.name,
-              phone: nc.phone,
+              phone,
               shopName: nc.shopName || "",
               address: nc.address || "",
               gstNumber: nc.gstNumber || "",
@@ -447,7 +449,7 @@ router.post(
           }
           customerName = customer ? customer.name : nc.name;
         } else if (customerType === "existing") {
-          customer = await Customer.findOne({ _id: req.body.customerId, owner: req.user._id }).session(session);
+          customer = await Customer.findOne({ _id: validateCustomerId(req.body.customerId), owner: req.user._id }).session(session);
           if (!customer) throw httpError(404, "Customer not found");
           customerName = customer.name;
         } else {

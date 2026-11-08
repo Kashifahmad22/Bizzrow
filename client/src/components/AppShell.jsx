@@ -19,27 +19,33 @@ import { useTheme } from "../context/ThemeContext.jsx";
 import { initials } from "../lib/format.js";
 import BusinessLogo from "./BusinessLogo.jsx";
 import clsx from "clsx";
+import toast from "react-hot-toast";
 
 const NAV = [
   { to: "/app", label: "Dashboard", icon: LayoutDashboard, end: true },
   { to: "/app/sales", label: "Sales", icon: ShoppingBag },
   { to: "/app/products", label: "Products", icon: Package },
+  { to: "/app/inventory-audits", label: "Inventory audits", icon: Package },
   { to: "/app/ledger", label: "Ledger", icon: Wallet },
   { to: "/app/ai", label: "Intelligence", icon: Sparkles },
   { to: "/app/whatsapp", label: "WhatsApp", icon: MessageCircle },
   { to: "/app/settings", label: "Settings", icon: SettingsIcon },
 ];
 
-const BOTTOM_NAV = NAV.slice(0, 5); // 5 most used for mobile bottom bar
+const BOTTOM_NAV = NAV.filter((entry) => ["/app", "/app/sales", "/app/products", "/app/ledger", "/app/ai"].includes(entry.to));
 
 export default function AppShell() {
   const { user, logout } = useAuth();
   const navigate = useNavigate();
   const [drawerOpen, setDrawerOpen] = useState(false);
 
-  const doLogout = () => {
-    logout();
-    navigate("/login");
+  const doLogout = async () => {
+    try {
+      await logout();
+      navigate("/login");
+    } catch (error) {
+      toast.error(error.message || "Could not log out. Please try again.");
+    }
   };
 
   return (

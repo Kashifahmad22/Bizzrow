@@ -136,7 +136,7 @@ async function addStockBatch({ Product, StockBatch, ownerId, productId, batch, s
   }], { session });
   const updated = await Product.updateOne(
     { _id: product._id, owner: ownerId, stock: product.stock },
-    { $set: { stock: add(product.stock, batch.quantityReceived) } },
+    { $set: { stock: add(product.stock, batch.quantityReceived) }, $inc: { stockRevision: 1 } },
     { session }
   );
   if (updated.modifiedCount !== 1) {

@@ -4,6 +4,7 @@ const Customer = require("../models/Customer");
 const asyncHandler = require("../utils/asyncHandler");
 const { protect } = require("../middleware/auth");
 const whatsapp = require("../services/whatsappService");
+const { broadcastRecipients } = require("../utils/broadcastRecipients");
 
 const router = express.Router();
 router.use(protect);
@@ -17,20 +18,18 @@ router.get(
   })
 );
 
-// POST /api/whatsapp/broadcast { customerIds?, body, mediaUrl? }
-// If customerIds omitted, broadcast to ALL customers.
+// POST /api/whatsapp/broadcast { allCustomers?, customerIds?, body, mediaUrl? }
 router.post(
   "/broadcast",
   asyncHandler(async (req, res) => {
-    const { customerIds, body, mediaUrl } = req.body;
-    if (!body || !body.trim()) {
+    const { body, mediaUrl } = req.body;
+    if (typeof body !== "string" || !body.trim()) {
       res.status(400);
       throw new Error("Message body is required");
     }
+    const recipients = broadcastRecipients(req.body);
     const query = { owner: req.user._id };
-    if (Array.isArray(customerIds) && customerIds.length > 0) {
-      query._id = { $in: customerIds };
-    }
+    if (recipients) query._id = { $in: recipients };
     const customers = await Customer.find(query);
     if (customers.length === 0) {
       res.status(400);

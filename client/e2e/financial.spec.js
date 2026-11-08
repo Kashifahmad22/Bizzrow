@@ -63,11 +63,77 @@ test("authentication guards, persists, and logs out", async ({ page, request }) 
   await page.reload();
   await expect(page).toHaveURL(/\/login$/);
   await login(page, user);
+  const loggedOutToken = await page.evaluate(() => localStorage.getItem("sv_token"));
   await page.getByRole("button", { name: /log out/i }).click();
   await expect(page).toHaveURL(/\/login$/);
+  expect((await request.get(`${api}/auth/me`, { headers: { Authorization: `Bearer ${loggedOutToken}` } })).status()).toBe(401);
   await page.goto("/app/sales");
   await expect(page).toHaveURL(/\/login$/);
 });
+
+test("logout can be retried after the server response is lost", async ({ page, request }) => {
+  const user = await seed(request);
+  await login(page, user);
+  const token = await page.evaluate(() => localStorage.getItem("sv_token"));
+  await page.route("**/api/auth/logout", async (route) => {
+    await route.fetch();
+    await route.abort("failed");
+  }, { times: 1 });
+  await page.getByRole("button", { name: /log out/i }).click();
+  await expect(page.getByText(/could not log out|network error/i)).toBeVisible();
+  expect((await request.get(`${api}/auth/me`, { headers: { Authorization: `Bearer ${token}` } })).status()).toBe(401);
+  await page.getByRole("button", { name: /log out/i }).click();
+  await expect(page).toHaveURL(/\/login$/);
+});
+
+test("a rejected audit approval can be cleared and counts corrected", async ({ page, request }) => {
+  const user = await seed(request);
+  await login(page, user);
+  await page.goto("/app/inventory-audits");
+  await page.getByLabel(/ABC 123/).check();
+  await page.getByRole("button", { name: /audit selected/i }).click();
+  const batch = page.getByText("Batch E2E", { exact: false }).locator("..");
+  await batch.getByLabel("Physical count").fill("11");
+  await batch.getByLabel("Reason for discrepancy").fill("Counted surplus");
+  await page.getByText("Unbatched", { exact: false }).locator("..").getByLabel("Physical count").fill("0");
+  await page.getByRole("button", { name: "Save counts and review" }).click();
+  await page.getByRole("button", { name: "Confirm and apply" }).click();
+  await expect(page.getByRole("button", { name: "Retry approval" })).toBeVisible();
+  await page.getByRole("button", { name: "Clear pending approval" }).click();
+  await expect(page.getByRole("alert")).toContainText("Reload the audit");
+  await batch.getByLabel("Physical count").fill("9");
+  await batch.getByLabel("Reason for discrepancy").fill("Counted shortage");
+  await page.getByRole("button", { name: "Save counts and review" }).click();
+  await page.getByRole("button", { name: "Confirm and apply" }).click();
+  await expect(page.getByText("Status: completed")).toBeVisible();
+});
+
+for (const viewport of [{ name: "desktop", width: 1280, height: 900 }, { name: "mobile", width: 390, height: 844 }]) {
+test(`${viewport.name} inventory audit reviews and applies a batch shortage`, async ({ page, request }) => {
+  await page.setViewportSize({ width: viewport.width, height: viewport.height });
+  const user = await seed(request);
+  await login(page, user);
+  await page.goto("/app/inventory-audits");
+  await page.getByPlaceholder("Search products").fill("ABC 123");
+  await page.getByLabel(/ABC 123/).check();
+  await page.getByRole("button", { name: /audit selected/i }).click();
+  await expect(page.getByText("Batch E2E", { exact: false })).toBeVisible();
+  const batch = page.getByText("Batch E2E", { exact: false }).locator("..");
+  await batch.getByLabel("Physical count").fill("9");
+  await batch.getByLabel("Reason for discrepancy").fill("Counted shortage");
+  const loose = page.getByText("Unbatched", { exact: false }).locator("..");
+  await loose.getByLabel("Physical count").fill("0");
+  await page.getByRole("button", { name: "Save counts and review" }).click();
+  await expect(page.getByText(/Shortage -1/)).toBeVisible();
+  await page.getByRole("button", { name: "Confirm and apply" }).click();
+  await expect(page.getByText("Status: completed")).toBeVisible();
+  const response = await request.get(`${api}/products/${user.product._id}/batches`, { headers: user.headers });
+  expect(response.status()).toBe(200);
+  const result = await response.json();
+  expect(result.product.stock).toBe(9);
+  expect(result.batches[0].remainingQuantity).toBe(9);
+});
+}
 
 test("naturally expiring token protects routes and login recovers the session", async ({ page, request }) => {
   const user = await seed(request);

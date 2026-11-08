@@ -346,6 +346,79 @@ not eliminated. npm proposes Vite 8.3.6 and react-router-dom 7.18.5, both major
 upgrades requiring separate compatibility review. No forced major upgrade was
 performed. Advisory data and counts can change over time.
 
+#### Server dependency audit (Sprint 4.1)
+
+The server audit initially reported 11 affected packages: one critical, three
+high and seven moderate. Compatible updates resolved the reported advisories
+for body-parser, brace-expansion, mongoose, morgan, protobufjs, proxy-addr and
+qs. Express 4.22.3 supplies the compatible body-parser, proxy-addr and qs
+updates. The lockfile also updates mquery with mongoose and removes an unused
+protobufjs dependency.
+The updated development-only brace-expansion 5.0.12 requires Node.js 20 or
+Node.js 22 and newer; it no longer supports Node.js 18. This does not change
+the production dependency tree.
+
+#### Inventory audits and logout
+
+Inventory audits snapshot each selected product's total stock, stock revision,
+individual batches and unbatched balance. Enter a count for every source and
+a reason for each discrepancy, save the review, then confirm approval. Approval
+requires the saved review revision and uses an idempotency key and MongoDB
+transaction. If stock has moved since the snapshot, start a new audit and
+recount. Batch increases are permitted only when the existing adjustment
+service allows reversal of prior reductions; unexplained surplus can instead
+be counted as unbatched stock. The audit stores links to the resulting stock
+adjustments; it does not change financial history. Counts preserving historical
+precision are supported when the resulting adjustment is valid at three
+decimal places.
+
+If approval fails, retry the same request to recover a lost response. To correct
+the counts instead, clear the pending approval and reload the audit to confirm
+its status; a stale stock snapshot requires a new audit.
+
+All application instances must use the stock-revision-aware code when audits
+are enabled. Mixed versions or out-of-band database writes can bypass the
+revision check and must not be used during an audit. Snapshot and approval
+require MongoDB transaction support. The audit list shows the latest 100 audits;
+product selection search shows up to 100 matches. Each audit is stored in one
+MongoDB document, so very large catalogs can exceed the document size limit;
+select smaller groups of products in that case.
+
+Logout records a hash of the current JWT in an owner-scoped revocation
+collection. Newly issued tokens include unique IDs, so logging out one device
+does not revoke another. Previously issued identical JWTs cannot be
+distinguished from one another. The token lifetime remains unchanged (seven
+days by default); password reset still invalidates all older token versions.
+Retrying logout with the same still-valid token is safe if its response was lost;
+that token remains rejected by other protected routes.
+The revocation collection declares a unique owner/token-hash index and a TTL
+index on expiration. Operators must ensure declared indexes are provisioned
+according to the deployment's index-management policy; no production indexes
+or migrations are created by this sprint.
+
+The production server applies per-process IP rate limits. Defaults are 30
+login/registration requests per 15 minutes, 10 recovery requests per 15
+minutes, 300 searches per minute, 120 dashboard/health requests per minute,
+and 30 AI/OCR/WhatsApp requests per minute. Configure each group with
+`RATE_LIMIT_AUTH_MAX`, `RATE_LIMIT_RECOVERY_MAX`, `RATE_LIMIT_SEARCH_MAX`,
+`RATE_LIMIT_DASHBOARD_MAX` or `RATE_LIMIT_EXTERNAL_MAX` and the matching
+`_WINDOW_MS` variable (for example `RATE_LIMIT_AUTH_WINDOW_MS`). Values must
+be positive integers. Financial mutations are not rate-limited by these
+groups. Limits are per server process, reset on restart, and do not provide
+shared enforcement across instances; shared networks can share a limit.
+Forwarded IPs are ignored unless `TRUST_PROXY` is explicitly set to a
+comma-separated list of trusted proxy addresses/subnets understood by Express.
+Configure it only after verifying the deployment's proxy topology.
+
+Four server packages remain in the audit: direct nodemailer 6.10.1 (high),
+direct uuid 9.0.1 (moderate), development dependency nodemon 3.1.14 (moderate),
+and its minimatch 10.2.5 (moderate). Nodemailer and uuid require major-version
+compatibility review; npm suggests downgrading nodemon to resolve minimatch,
+which also requires separate review. An advisory does not establish that its
+affected functionality is reachable in this application. The client audit
+still reports the four packages documented above. Audit results can change as
+new advisories are published.
+
 ---
 
 ### 📄 PDF Invoices

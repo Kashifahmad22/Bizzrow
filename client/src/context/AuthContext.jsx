@@ -42,7 +42,8 @@ export function AuthProvider({ children }) {
     return data.user;
   };
 
-  const logout = () => {
+  const logout = async () => {
+    await api.post("/auth/logout");
     localStorage.removeItem("sv_token");
     setUser(null);
   };

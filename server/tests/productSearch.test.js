@@ -6,6 +6,7 @@ const mongoose = require("mongoose");
 const test = require("node:test");
 const Product = require("../models/Product");
 const User = require("../models/User");
+const RevokedSession = require("../models/RevokedSession");
 const { errorHandler } = require("../middleware/error");
 const { buildTextFilter } = require("../utils/search");
 
@@ -107,6 +108,7 @@ test("product search API preserves literal matching, tenant scope, and paginatio
   const oldFind = Product.find;
   const oldCountDocuments = Product.countDocuments;
   const oldFindById = User.findById;
+  const oldRevokedExists = RevokedSession.exists;
   const previousSecret = process.env.JWT_SECRET;
   process.env.JWT_SECRET = crypto.randomUUID();
 
@@ -116,6 +118,7 @@ test("product search API preserves literal matching, tenant scope, and paginatio
   User.findById = () => ({
     select: async () => ({ _id: ownerId, tokenVersion: 0 }),
   });
+  RevokedSession.exists = async () => null;
 
   const app = express();
   app.use("/products", require("../routes/products"));
@@ -227,6 +230,7 @@ test("product search API preserves literal matching, tenant scope, and paginatio
     Product.find = oldFind;
     Product.countDocuments = oldCountDocuments;
     User.findById = oldFindById;
+    RevokedSession.exists = oldRevokedExists;
     if (previousSecret === undefined) delete process.env.JWT_SECRET;
     else process.env.JWT_SECRET = previousSecret;
   }

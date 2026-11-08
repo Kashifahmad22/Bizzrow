@@ -20,6 +20,7 @@ const productSchema = new mongoose.Schema(
     retailPrice: { type: Number, default: null, min: 0 },
     sellingPrice: { type: Number, required: true, min: 0 },
     stock: { type: Number, required: true, default: 0, min: 0 },
+    stockRevision: { type: Number, default: 0 },
     image: { type: String, default: "" }, // base64 data URL
     soldCount: { type: Number, default: 0 },
   },

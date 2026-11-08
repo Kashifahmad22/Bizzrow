@@ -4,6 +4,7 @@ const LedgerEntry = require("../models/LedgerEntry");
 const Sale = require("../models/Sale");
 const asyncHandler = require("../utils/asyncHandler");
 const { protect } = require("../middleware/auth");
+const { customerId } = require("../utils/customerInput");
 const whatsapp = require("../services/whatsappService");
 const { buildLedgerStatementPdf } = require("../services/pdfService");
 const { round2, paymentPaise } = require("../utils/saleMath");
@@ -17,6 +18,14 @@ const {
 
 const router = express.Router();
 router.use(protect);
+router.param("customerId", (req, res, next, value) => {
+  try {
+    req.params.customerId = customerId(value);
+    next();
+  } catch (error) {
+    next(error);
+  }
+});
 
 // Compute a ledger statement: opening balance (signed sum before `from`),
 // running balance per in-range entry, and closing balance. Reused by JSON + PDF.

@@ -38,7 +38,7 @@ async function decrementStock({ Product, StockBatch, items, ownerId, session }) 
 
     const result = await Product.updateOne(
       { _id: productId, owner: ownerId, stock: product.stock },
-      { $set: { stock: subtract(product.stock, quantity), soldCount: add(product.soldCount || 0, quantity) } },
+      { $set: { stock: subtract(product.stock, quantity), soldCount: add(product.soldCount || 0, quantity) }, $inc: { stockRevision: 1 } },
       { session }
     );
     if (result.modifiedCount !== 1) {

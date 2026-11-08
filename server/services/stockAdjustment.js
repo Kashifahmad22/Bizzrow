@@ -38,7 +38,7 @@ async function adjustStock({ Product, StockBatch, StockAdjustment, ownerId, prod
   }
   const update = await Product.updateOne(
     { _id: product._id, owner: ownerId, stock: product.stock },
-    { $set: { stock: add(product.stock, delta) } }, { session }
+    { $set: { stock: add(product.stock, delta) }, $inc: { stockRevision: 1 } }, { session }
   );
   if (update.modifiedCount !== 1) throw error(409, "Product stock changed; retry the adjustment");
   const [adjustment] = await StockAdjustment.create([{
