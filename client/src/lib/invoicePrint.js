@@ -31,12 +31,18 @@ function invoiceRows(invoice) {
   } else if (Number(invoice.totalDiscount) > 0 && !Number(invoice.itemDiscountTotal)) {
     rows.push(["Discount", `- ${amount(invoice.totalDiscount)}`, "positive"]);
   }
-  rows.push(["TAX SUMMARY", "", "tax-header"]);
-  rows.push(["Taxable amount", "Not recorded", "tax"]);
-  rows.push(["CGST", "—", "tax"]);
-  rows.push(["SGST", "—", "tax"]);
-  rows.push(["IGST", "—", "tax"]);
-  rows.push(["Total tax", "Not recorded", "tax-total"]);
+  // Tax recording and persistence are intentionally deferred to a separate GST implementation.
+  const taxBreakdown = Array.isArray(invoice.taxBreakdown) ? invoice.taxBreakdown : [];
+  const savedTaxes = taxBreakdown.filter((entry) => entry
+    && (entry.amount ?? entry.taxAmount) != null
+    && (entry.amount ?? entry.taxAmount) !== ""
+    && Number.isFinite(Number(entry.amount ?? entry.taxAmount)));
+  if (savedTaxes.length) {
+    rows.push(["TAX SUMMARY", "", "tax-header"]);
+    for (const entry of savedTaxes) {
+      rows.push([entry.label || entry.name || "Tax", amount(entry.amount ?? entry.taxAmount), "tax"]);
+    }
+  }
   rows.push(["Grand total", amount(invoice.total), "grand"]);
   for (const payment of invoice.payments || []) {
     const label = PAYMENT_LABELS[payment.method] || payment.method;
@@ -89,7 +95,7 @@ export function buildInvoicePrintHtml(invoice, format = "a4") {
     ["IFSC", business.bankDetails?.ifscCode],
     ["Branch", business.bankDetails?.branchName],
   ].filter(([, value]) => typeof value === "string" && value.trim())
-    .map(([label, value]) => `<div><dt>${escapeHtml(label)}</dt><dd>${escapeHtml(value.trim())}</dd></div>`)
+    .map(([label, value]) => `<div><dt>${escapeHtml(label)}:</dt><dd>${escapeHtml(value.trim())}</dd></div>`)
     .join("");
   const contact = [business.address, business.phone, business.email, business.gstNumber && `GSTIN: ${business.gstNumber}`]
     .filter(Boolean)
@@ -141,6 +147,21 @@ export function buildInvoicePrintHtml(invoice, format = "a4") {
   const itemContent = thermal
     ? `<section class="thermal-items">${itemRows || "<p>No item details recorded.</p>"}</section>`
     : `<table><thead><tr><th>#</th><th>Item / product code</th><th class="numeric">Qty</th><th>Unit</th><th class="numeric">Rate</th><th class="numeric">Disc.</th><th class="numeric">Line total</th></tr></thead><tbody>${itemRows}</tbody></table>`;
+  const printScript = thermal
+    ? 'window.addEventListener("load",()=>setTimeout(()=>window.print(),300));'
+    : `window.addEventListener("load",()=>setTimeout(()=>{
+      const invoice=document.querySelector(".invoice-content");
+      const limit=document.createElement("div");
+      limit.style.cssText="position:absolute;height:277mm;visibility:hidden;left:-10000px";
+      document.body.appendChild(limit);
+      const printableHeight=limit.getBoundingClientRect().height;
+      limit.remove();
+      if(invoice.getBoundingClientRect().height>printableHeight-2){
+        document.body.innerHTML="<main role=\\"alert\\" style=\\"font:16px Arial,sans-serif;padding:24px\\">This invoice is too long to print on one A4 page. Reduce the number or length of invoice items or terms and try again.</main>";
+        return;
+      }
+      window.print();
+    },300));`;
   const style = thermal ? `
     @page { size: ${width} auto; margin: 3mm; }
     body { width: ${format === "thermal58" ? "52mm" : "74mm"}; margin: 0 auto; font: ${format === "thermal58" ? "10px" : "11px"} Arial, sans-serif; color: #202438; }
@@ -152,6 +173,7 @@ export function buildInvoicePrintHtml(invoice, format = "a4") {
     .thermal-item { padding: 2mm 0; border-bottom: 1px dotted #bbb; break-inside: avoid; overflow-wrap: anywhere; }
     .thermal-row, .summary-row { display: flex; justify-content: space-between; gap: 2mm; margin: 1mm 0; }
     .thermal-row span, .summary-row span { overflow-wrap: anywhere; }
+    .invoice-bottom { display: flex; flex-direction: column-reverse; }
     .sub { color: #555; font-size: 9px; margin-top: 1mm; overflow-wrap: anywhere; }
     .summary { border-bottom: 1px dashed #888; padding: 2mm 0; } .tax-header { border-top: 1px dashed #888; padding-top: 1mm; margin-top: 2mm; font-size: .9em; font-weight: bold; } .tax-total { font-weight: bold; } .grand { font-size: 1.08em; font-weight: bold; border-top: 1px dashed #888; padding-top: 1mm; }
     .bank-details { border-top: 1px dashed #888; padding-top: 2mm; margin-top: 2mm; } .bank-details h2 { font-size: 10px; text-transform: uppercase; } .bank-details dl { margin: 0; } .bank-details dl > div { display: flex; gap: 2mm; margin: 1mm 0; overflow-wrap: anywhere; } .bank-details dt { font-weight: bold; } .bank-details dd { margin: 0; overflow-wrap: anywhere; }
@@ -160,30 +182,32 @@ export function buildInvoicePrintHtml(invoice, format = "a4") {
     .terms ol { padding-left: 4mm; margin: 1mm 0; } .terms li { margin: 1mm 0; overflow-wrap: anywhere; }
     footer { border-top: 1px dashed #888; padding-top: 2mm; text-align: center; font-size: 9px; }
   ` : `
-    @page { size: A4; margin: 14mm; }
-    body { margin: 0; font: 10pt Arial, sans-serif; color: #202438; } .brand { display: flex; gap: 12px; align-items: flex-start; }
-    .logo { width: 25mm; height: 25mm; object-fit: contain; object-position: center; background: #fff; flex: 0 0 auto; } h1 { font-size: 22pt; margin: 0 0 3mm; }
-    .contact { color: #596176; font-size: 9pt; line-height: 1.4; overflow-wrap: anywhere; }
+    @page { size: A4 portrait; margin: 10mm; }
+    body { margin: 0; font: 9pt Arial, sans-serif; color: #202438; } .brand { display: flex; gap: 8px; align-items: flex-start; }
+    .logo { width: 19mm; height: 19mm; object-fit: contain; object-position: center; background: #fff; flex: 0 0 auto; } h1 { font-size: 18pt; margin: 0 0 2mm; }
+    .contact { color: #596176; font-size: 7.5pt; line-height: 1.25; overflow-wrap: anywhere; }
     .doc-title { margin-left: auto; font-size: 18pt; font-weight: bold; color: #3849f5; text-align: right; }
-    .parties { display: flex; justify-content: space-between; gap: 15mm; border-top: 1px solid #dfe3ed; border-bottom: 1px solid #dfe3ed; margin: 8mm 0 5mm; padding: 4mm 0; }
-    .parties > div { flex: 1; overflow-wrap: anywhere; } h2 { font-size: 9pt; text-transform: uppercase; letter-spacing: .04em; color: #687087; margin: 0 0 2mm; }
+    .parties { display: flex; justify-content: space-between; gap: 10mm; border-top: 1px solid #dfe3ed; border-bottom: 1px solid #dfe3ed; margin: 3mm 0 2mm; padding: 1.5mm 0; }
+    .parties > div { flex: 1; overflow-wrap: anywhere; } h2 { font-size: 7.5pt; text-transform: uppercase; letter-spacing: .04em; color: #687087; margin: 0 0 1mm; }
     .sale-meta { text-align: right; } table { width: 100%; border-collapse: collapse; font-size: 8pt; table-layout: fixed; }
-    th { background: #f4f6fb; font-size: 7pt; text-align: left; } th, td { padding: 2.3mm 1.2mm; border-bottom: 1px solid #e6e8f0; vertical-align: top; overflow-wrap: anywhere; }
-    .numeric { text-align: right; }     .sub { color: #687087; font-size: 7pt; margin-top: 1mm; }
-    .summary { width: min(100%, 90mm); margin: 5mm 0 0 auto; } .summary-row { display: flex; justify-content: space-between; gap: 5mm; padding: 1.2mm 0; }
-    .summary-row strong { text-align: right; white-space: nowrap; } .grand { font-size: 11pt; font-weight: bold; border-top: 1px solid #687087; margin-top: 1mm; padding-top: 2mm; }
-    .tax-header { border-top: 1px solid #dfe3ed; padding-top: 2mm; margin-top: 2mm; color: #687087; font-size: 7pt; font-weight: bold; letter-spacing: .04em; } .tax-total { font-weight: bold; }
-    .bank-details { margin: 6mm 0 0; padding: 4mm; border: 1px solid #dfe3ed; border-radius: 2mm; break-inside: avoid; } .bank-details h2 { margin: 0 0 3mm; } .bank-details dl { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 3mm 6mm; margin: 0; } .bank-details dl > div { min-width: 0; overflow-wrap: anywhere; } .bank-details dt { color: #687087; font-size: 7pt; text-transform: uppercase; } .bank-details dd { margin: 1mm 0 0; font-size: 8pt; overflow-wrap: anywhere; }
+    th { background: #f4f6fb; font-size: 7pt; text-align: left; } th, td { padding: 1mm 1mm; border-bottom: 1px solid #e6e8f0; vertical-align: top; overflow-wrap: anywhere; }
+    .numeric { text-align: right; } .sub { color: #687087; font-size: 6.5pt; margin-top: .5mm; }
+    .invoice-bottom { display: grid; grid-template-columns: minmax(0, 1fr) minmax(72mm, 88mm); gap: 8mm; align-items: start; margin-top: 2mm; }
+    .summary { min-width: 0; margin: 0; } .summary-row { display: flex; justify-content: space-between; gap: 4mm; padding: .65mm 0; font-size: 7.5pt; }
+    .summary-row strong { text-align: right; white-space: nowrap; } .grand { font-size: 9.5pt; font-weight: bold; border-top: 1px solid #687087; margin-top: .5mm; padding-top: 1mm; }
+    .tax-header { border-top: 1px solid #dfe3ed; padding-top: 1mm; margin-top: 1mm; color: #687087; font-size: 6.5pt; font-weight: bold; letter-spacing: .04em; } .tax { color: #687087; font-size: 7pt; }
+    .bank-details { min-width: 0; margin: 0; padding: 1mm 0 0; break-inside: avoid; } .bank-details h2 { margin: 0 0 1.5mm; } .bank-details dl { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 1.5mm 4mm; margin: 0; } .bank-details dl > div { display: flex; flex-wrap: wrap; gap: 1mm; min-width: 0; overflow-wrap: anywhere; font-size: 7pt; } .bank-details dt { color: #687087; font-size: 6.5pt; } .bank-details dd { margin: 0; overflow-wrap: anywhere; }
     .positive { color: #176f40; } .due { font-weight: bold; color: #a22; }
-    .terms { margin-top: 7mm; font-size: 8pt; } .terms h2 { font-size: 8pt; } .terms li { margin: 1.5mm 0; break-inside: avoid; }
-    footer { margin-top: 10mm; display: flex; justify-content: space-between; color: #687087; font-size: 8pt; }
-    thead { display: table-header-group; } tr, .summary, .terms { break-inside: avoid; }
+    .terms { margin-top: 2mm; font-size: 6.8pt; line-height: 1.2; } .terms h2 { font-size: 7pt; } .terms ol { margin: 1mm 0 0; padding-left: 4mm; } .terms li { margin: .5mm 0; break-inside: avoid; }
+    footer { margin-top: 2mm; padding-top: 1.5mm; border-top: 1px solid #dfe3ed; display: flex; justify-content: space-between; align-items: end; gap: 4mm; color: #687087; font-size: 7pt; }
+    .signature { min-width: 32mm; border-top: 1px solid #687087; padding-top: 1mm; text-align: center; }
+    thead { display: table-header-group; } tr, .invoice-bottom, .summary, .terms, footer { break-inside: avoid; }
   `;
 
   return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Invoice ${escapeHtml(invoice.invoiceNumber || "")}</title><style>*{box-sizing:border-box} ${style}</style></head>
-    <body><header class="brand">${logo}<div><h1>${escapeHtml(business.name || "Bizzrow")}</h1><div class="contact">${contact}</div></div>${thermal ? "" : '<div class="doc-title">INVOICE</div>'}</header>
+    <body><main class="invoice-content"><header class="brand">${logo}<div><h1>${escapeHtml(business.name || "Bizzrow")}</h1><div class="contact">${contact}</div></div>${thermal ? "" : '<div class="doc-title">INVOICE</div>'}</header>
     ${thermal ? '<div class="doc-title">INVOICE</div>' : ""}
-    ${details}${itemContent}<section class="summary">${summaryRows}</section>${bankDetails ? `<section class="bank-details"><h2>Bank details</h2><dl>${bankDetails}</dl></section>` : ""}${termsHtml}
-    <footer><span>Thank you for your business.</span>${business.phone ? `<span>${escapeHtml(business.phone)}</span>` : ""}</footer>
-    <script>window.addEventListener("load",()=>setTimeout(()=>window.print(),300));</script></body></html>`;
+    ${details}${itemContent}<section class="invoice-bottom">${bankDetails ? `<section class="bank-details"><h2>Bank details</h2><dl>${bankDetails}</dl></section>` : "<div></div>"}<section class="summary">${summaryRows}</section></section>${termsHtml}
+    <footer><span>Thank you for your business.${business.phone ? ` Contact: ${escapeHtml(business.phone)}` : ""}</span><span class="signature">Authorized signature</span></footer></main>
+    <script>${printScript}</script></body></html>`;
 }

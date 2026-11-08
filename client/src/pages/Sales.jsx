@@ -980,6 +980,8 @@ function InvoiceModal({ invoice, onClose, onChanged }) {
   const [replaceOpen, setReplaceOpen] = useState(false);
   const [history, setHistory] = useState([]);
   const returnable = (invoice.items || []).some((it) => (it.quantity || 0) - (it.returnedQty || 0) > 0);
+  const hasBankDetails = Object.values(invoice.business?.bankDetails || {})
+    .some((value) => typeof value === "string" && value.trim());
   const printInvoice = () => {
     let printWindow;
     try {
@@ -1118,43 +1120,11 @@ function InvoiceModal({ invoice, onClose, onChanged }) {
           </tbody>
         </table>
         </div>
-        <div className="mt-4 ml-auto max-w-xs space-y-1.5 text-sm">
-          <Row label="Items subtotal" value={formatINR(invoice.subtotal ?? invoice.total)} />
-          {invoice.itemDiscountTotal > 0 && <Row label="Line discounts (included above)" value={`− ${formatINR(invoice.itemDiscountTotal)}`} positive />}
-          {invoice.billDiscountAmount > 0 && (
-            <Row
-              label={invoice.billDiscountType === "percent" ? `Bill discount (${invoice.billDiscountValue}%)` : "Bill discount"}
-              value={`− ${formatINR(invoice.billDiscountAmount)}`}
-              positive
-            />
-          )}
-          {!invoice.billDiscountAmount && invoice.totalDiscount > 0 && !invoice.itemDiscountTotal && (
-            <Row label="Discount" value={`− ${formatINR(invoice.totalDiscount)}`} positive />
-          )}
-          <div className="my-2 rounded-lg border border-ink-200/60 p-2.5">
-            <div className="text-[10px] font-semibold uppercase tracking-wider text-ink-500 mb-1">Tax summary</div>
-            <Row label="Taxable amount" value="Not recorded" muted />
-            <Row label="CGST" value="—" muted />
-            <Row label="SGST" value="—" muted />
-            <Row label="IGST" value="—" muted />
-            <Row label="Total tax" value="Not recorded" muted />
-          </div>
-          <Row label="Total" value={formatINR(invoice.total)} />
-          {invoice.returnedAmount > 0 && (
-            <>
-              <Row label="Returned" value={`− ${formatINR(invoice.returnedAmount)}`} positive />
-              <Row label="Net total" value={formatINR(invoice.netTotal ?? invoice.total - invoice.returnedAmount)} bold />
-            </>
-          )}
-          {invoice.payments?.length > 0 &&
-            invoice.payments.map((p, i) => <Row key={i} label={methodLabel[p.method] || p.method} value={formatINR(p.amount)} muted />)}
-          <Row label="Paid" value={formatINR(invoice.amountPaid)} positive />
-          <Row label="Due" value={formatINR(invoice.dueAmount)} negative={invoice.dueAmount > 0} bold />
-        </div>
-        {Object.values(invoice.business?.bankDetails || {}).some((value) => typeof value === "string" && value.trim()) && (
-          <section className="mt-5 rounded-xl border border-ink-200/60 p-4">
-            <h3 className="text-xs font-semibold uppercase tracking-wider text-ink-500 mb-3">Bank details</h3>
-            <dl className="grid grid-cols-1 sm:grid-cols-2 gap-3 text-sm">
+        <div className="mt-4 grid grid-cols-1 sm:grid-cols-2 gap-6 items-start">
+          {hasBankDetails && (
+            <section className="pt-1">
+              <h3 className="text-[10px] font-semibold uppercase tracking-wider text-ink-500 mb-2">Bank details</h3>
+              <dl className="grid grid-cols-1 gap-1.5 text-xs">
               {[
                 ["Bank name", invoice.business.bankDetails.bankName],
                 ["Account holder", invoice.business.bankDetails.accountHolderName],
@@ -1162,14 +1132,58 @@ function InvoiceModal({ invoice, onClose, onChanged }) {
                 ["IFSC", invoice.business.bankDetails.ifscCode],
                 ["Branch", invoice.business.bankDetails.branchName],
               ].filter(([, value]) => typeof value === "string" && value.trim()).map(([label, value]) => (
-                <div key={label} className="min-w-0">
-                  <dt className="text-[10px] uppercase tracking-wider text-ink-400">{label}</dt>
-                  <dd className="mt-0.5 break-words text-ink-800">{value}</dd>
+                <div key={label} className="flex flex-wrap gap-x-1.5 min-w-0">
+                  <dt className="text-ink-500">{label}:</dt>
+                  <dd className="break-all text-ink-800">{value}</dd>
                 </div>
               ))}
-            </dl>
-          </section>
-        )}
+              </dl>
+            </section>
+          )}
+          <div className={`space-y-1.5 text-sm ${hasBankDetails ? "sm:col-start-2" : ""}`}>
+            <Row label="Items subtotal" value={formatINR(invoice.subtotal ?? invoice.total)} />
+            {invoice.itemDiscountTotal > 0 && <Row label="Line discounts (included above)" value={`− ${formatINR(invoice.itemDiscountTotal)}`} positive />}
+            {invoice.billDiscountAmount > 0 && (
+              <Row
+                label={invoice.billDiscountType === "percent" ? `Bill discount (${invoice.billDiscountValue}%)` : "Bill discount"}
+                value={`− ${formatINR(invoice.billDiscountAmount)}`}
+                positive
+              />
+            )}
+            {!invoice.billDiscountAmount && invoice.totalDiscount > 0 && !invoice.itemDiscountTotal && (
+              <Row label="Discount" value={`− ${formatINR(invoice.totalDiscount)}`} positive />
+            )}
+            {Array.isArray(invoice.taxBreakdown) && invoice.taxBreakdown.some((entry) => entry
+              && (entry.amount ?? entry.taxAmount) != null
+              && (entry.amount ?? entry.taxAmount) !== ""
+              && Number.isFinite(Number(entry.amount ?? entry.taxAmount))) && (
+              <div className="border-t border-ink-200/60 pt-1.5">
+                <div className="text-[10px] font-semibold uppercase tracking-wider text-ink-400 mb-1">Tax summary</div>
+                {invoice.taxBreakdown.filter((entry) => entry
+                  && (entry.amount ?? entry.taxAmount) != null
+                  && (entry.amount ?? entry.taxAmount) !== ""
+                  && Number.isFinite(Number(entry.amount ?? entry.taxAmount))).map((entry, index) => (
+                  <Row key={`${entry.label || entry.name || "tax"}-${index}`}
+                    label={entry.label || entry.name || "Tax"}
+                    value={formatINR(entry.amount ?? entry.taxAmount)}
+                    muted
+                  />
+                ))}
+              </div>
+            )}
+            <Row label="Total" value={formatINR(invoice.total)} />
+            {invoice.returnedAmount > 0 && (
+              <>
+                <Row label="Returned" value={`− ${formatINR(invoice.returnedAmount)}`} positive />
+                <Row label="Net total" value={formatINR(invoice.netTotal ?? invoice.total - invoice.returnedAmount)} bold />
+              </>
+            )}
+            {invoice.payments?.length > 0 &&
+              invoice.payments.map((p, i) => <Row key={i} label={methodLabel[p.method] || p.method} value={formatINR(p.amount)} muted />)}
+            <Row label="Paid" value={formatINR(invoice.amountPaid)} positive />
+            <Row label="Due" value={formatINR(invoice.dueAmount)} negative={invoice.dueAmount > 0} bold />
+          </div>
+        </div>
         {Array.isArray(invoice.invoiceTerms) && invoice.invoiceTerms.length > 0 && (
           <div className="mt-5 pt-4 border-t border-ink-200/50">
             <div className="text-xs font-semibold uppercase tracking-wider text-ink-500 mb-2">Terms and conditions</div>

@@ -72,12 +72,16 @@ function invoiceRows(sale) {
   if (number(sale.totalDiscount) > 0 && !number(sale.itemDiscountTotal) && !number(sale.billDiscountAmount)) {
     rows.push(["Discount", `- ${currency(sale.totalDiscount)}`]);
   }
-  rows.push(["TAX SUMMARY", "", "tax-header"]);
-  rows.push(["Taxable amount", "Not recorded", "tax"]);
-  rows.push(["CGST", "—", "tax"]);
-  rows.push(["SGST", "—", "tax"]);
-  rows.push(["IGST", "—", "tax"]);
-  rows.push(["Total tax", "Not recorded", "tax-total"]);
+  // Tax recording and persistence are intentionally deferred to a separate GST implementation.
+  const savedTaxes = (Array.isArray(sale.taxBreakdown) ? sale.taxBreakdown : []).filter((entry) => {
+    const taxAmount = entry?.amount ?? entry?.taxAmount;
+    return entry && taxAmount != null && taxAmount !== "" && Number.isFinite(Number(taxAmount));
+  });
+  if (savedTaxes.length) rows.push(["TAX SUMMARY", "", "tax-header"]);
+  for (const entry of savedTaxes) {
+    const taxAmount = entry?.amount ?? entry?.taxAmount;
+    rows.push([printable(entry.label || entry.name || "Tax"), currency(taxAmount), "tax"]);
+  }
   rows.push(["Grand total", currency(sale.total), "grand"]);
 
   for (const payment of Array.isArray(sale.payments) ? sale.payments : []) {
@@ -110,47 +114,52 @@ function invoiceRows(sale) {
   return rows;
 }
 
-function drawA4Header(doc, sale, business, continuation = false) {
+function drawA4Header(doc, sale, business) {
   const left = 40;
   const right = 555;
   let textX = left;
-  if (drawBusinessLogo(doc, business.logo, left, 34, 58, 52)) textX += 66;
+  if (drawBusinessLogo(doc, business.logo, left, 32, 54, 48)) textX += 62;
+  const businessWidth = 350 - textX;
 
-  doc.fillColor(COLORS.ink).font("Helvetica-Bold").fontSize(18)
-    .text(printable(business.name, "Bizzrow"), textX, 37, { width: 285 });
+  const businessName = printable(business.name, "Bizzrow");
+  doc.fillColor(COLORS.ink).font("Helvetica-Bold").fontSize(17)
+    .text(businessName, textX, 34, { width: businessWidth });
+  doc.font("Helvetica-Bold").fontSize(17);
+  let contactY = 34 + doc.heightOfString(businessName, { width: businessWidth, fontSize: 17, lineGap: 1 }) + 3;
   const contacts = [
     business.address,
     [business.phone && `Phone: ${business.phone}`, business.email].filter(Boolean).join(" | "),
     business.gstNumber && `GSTIN: ${business.gstNumber}`,
     business.upiId && `UPI: ${business.upiId}`,
   ].filter(Boolean).map((line) => printable(line));
-  doc.font("Helvetica").fontSize(8).fillColor(COLORS.muted);
-  let contactY = 62;
+  doc.font("Helvetica").fontSize(7.5).fillColor(COLORS.muted);
   for (const line of contacts) {
-    const height = doc.heightOfString(line, { width: 285, fontSize: 8, lineGap: 1 });
-    doc.text(line, textX, contactY, { width: 285, fontSize: 8, lineGap: 1 });
-    contactY += height + 2;
+    const height = doc.heightOfString(line, { width: businessWidth, fontSize: 7.5, lineGap: 1 });
+    doc.text(line, textX, contactY, { width: businessWidth, fontSize: 7.5, lineGap: 1 });
+    contactY += height + 1;
   }
 
-  doc.fillColor(COLORS.brand).font("Helvetica-Bold").fontSize(21)
-    .text(continuation ? "INVOICE (CONT.)" : "INVOICE", 365, 37, { width: 190, align: "right" });
+  doc.fillColor(COLORS.brand).font("Helvetica-Bold").fontSize(20)
+    .text("INVOICE", 365, 34, { width: 190, align: "right" });
   doc.fillColor(COLORS.ink).fontSize(9).font("Helvetica-Bold")
-    .text(`Invoice: ${printable(sale.invoiceNumber, "Not assigned")}`, 365, 67, { width: 190, align: "right" });
+    .text(`Invoice: ${printable(sale.invoiceNumber, "Not assigned")}`, 365, 61, { width: 190, align: "right" });
   doc.font("Helvetica").fontSize(8).fillColor(COLORS.muted)
-    .text(`Date: ${dateLabel(sale.createdAt)}`, 365, 82, { width: 190, align: "right" });
-  if (sale.dueDate) doc.text(`Due date: ${dateLabel(sale.dueDate)}`, 365, 95, { width: 190, align: "right" });
-  if (sale.saleType) doc.text(`${printable(sale.saleType).toUpperCase()} SALE`, 365, 108, { width: 190, align: "right" });
-  const headerBottom = Math.max(contactY + 2, 128);
+    .text(`Date: ${dateLabel(sale.createdAt)}`, 365, 75, { width: 190, align: "right" });
+  if (sale.dueDate) doc.text(`Due date: ${dateLabel(sale.dueDate)}`, 365, 87, { width: 190, align: "right" });
+  if (sale.saleType) doc.text(`${printable(sale.saleType).toUpperCase()} SALE`, 365, sale.dueDate ? 99 : 87, { width: 190, align: "right" });
+  const headerBottom = Math.max(contactY + 4, 112);
   doc.moveTo(left, headerBottom).lineTo(right, headerBottom).strokeColor(COLORS.line).lineWidth(1).stroke();
-  return headerBottom + 13;
+  return headerBottom + 10;
 }
 
 function drawA4Customer(doc, sale, customer, y) {
   const left = 40;
-  doc.font("Helvetica-Bold").fontSize(8).fillColor(COLORS.muted).text("BILL TO", left, y);
+  doc.font("Helvetica-Bold").fontSize(7.5).fillColor(COLORS.muted).text("BILL TO", left, y);
   const name = printable(customer.name || sale.customerName, "Walk-in Customer");
-  doc.font("Helvetica-Bold").fontSize(11).fillColor(COLORS.ink).text(name, left, y + 13, { width: 300 });
-  let infoY = y + 29;
+  const nameY = y + 11;
+  doc.font("Helvetica-Bold").fontSize(10).fillColor(COLORS.ink).text(name, left, nameY, { width: 300 });
+  doc.font("Helvetica-Bold").fontSize(10);
+  let infoY = nameY + doc.heightOfString(name, { width: 300, fontSize: 10, lineGap: 1 }) + 3;
   const details = [
     customer.phone,
     customer.shopName,
@@ -158,13 +167,18 @@ function drawA4Customer(doc, sale, customer, y) {
     customer.gstNumber || customer.gstin,
     sale.customerType === "walkin" ? "Walk-in sale" : "",
   ].filter(Boolean).map((line) => printable(line));
-  doc.font("Helvetica").fontSize(8).fillColor(COLORS.muted);
+  doc.font("Helvetica").fontSize(7.5).fillColor(COLORS.muted);
   for (const detail of details) {
-    const height = doc.heightOfString(detail, { width: 300, fontSize: 8, lineGap: 1 });
-    doc.text(detail, left, infoY, { width: 300, fontSize: 8, lineGap: 1 });
-    infoY += height + 1;
+    const height = doc.heightOfString(detail, { width: 300, fontSize: 7.5, lineGap: 1 });
+    doc.text(detail, left, infoY, { width: 300, fontSize: 7.5, lineGap: 1 });
+    infoY += height + 0.5;
   }
-  return Math.max(infoY, y + 36) + 10;
+  doc.font("Helvetica-Bold").fontSize(7.5).fillColor(COLORS.muted)
+    .text("SALE DETAILS", 390, y, { width: 165, align: "right" });
+  doc.font("Helvetica").fontSize(7.5).fillColor(COLORS.muted)
+    .text(`${printable(sale.saleType || "sale").toUpperCase()}  |  ${sale.customerType === "walkin" ? "Walk-in" : "Customer invoice"}`,
+      390, y + 11, { width: 165, align: "right" });
+  return Math.max(infoY, y + 24) + 8;
 }
 
 const A4_COLUMNS = [
@@ -187,8 +201,8 @@ function drawA4TableHeader(doc, y) {
 }
 
 function drawA4Footer(doc, pageNumber, pageCount, business) {
-  const bottom = doc.page.height - 32;
-  doc.moveTo(40, bottom - 8).lineTo(555, bottom - 8).strokeColor(COLORS.line).lineWidth(0.7).stroke();
+  const bottom = doc.page.height - 25;
+  doc.moveTo(40, bottom - 7).lineTo(555, bottom - 7).strokeColor(COLORS.line).lineWidth(0.7).stroke();
   doc.font("Helvetica").fontSize(7).fillColor(COLORS.muted)
     .text(printable(business.phone ? `Contact: ${business.phone}` : "Thank you for your business."), 40, bottom, {
       width: 390,
@@ -208,38 +222,29 @@ function buildA4(sale, business, customer) {
 
       let y = drawA4Header(doc, sale, business);
       y = drawA4Customer(doc, sale, customer, y);
-      y += 3;
+      y += 2;
       y = drawA4TableHeader(doc, y);
-
-      const pageBottom = doc.page.height - 48;
-      const addContinuationPage = () => {
-        doc.addPage({ size: "A4", margin: 0 });
-        let nextY = drawA4Header(doc, sale, business, true);
-        nextY = drawA4TableHeader(doc, nextY + 2);
-        return nextY;
-      };
 
       (sale.items || []).forEach((item, index) => {
         const itemLines = [
           printable(item.name, "Item"),
           [item.sku && `SKU: ${item.sku}`, item.color, item.size].filter(Boolean).map(printable).join(" | "),
         ].filter(Boolean);
-        doc.font("Helvetica").fontSize(8);
+        doc.font("Helvetica").fontSize(7.5);
         const itemHeight = itemLines.reduce((height, line, lineIndex) =>
-          height + doc.heightOfString(line, { width: A4_COLUMNS[1].width, fontSize: lineIndex ? 7 : 8, lineGap: 1 }), 0);
-        const rowHeight = Math.max(19, itemHeight + 8);
-        if (y + rowHeight > pageBottom) y = addContinuationPage();
+          height + doc.heightOfString(line, { width: A4_COLUMNS[1].width, fontSize: lineIndex ? 6.8 : 7.5, lineGap: 0.5 }), 0);
+        const rowHeight = Math.max(16, itemHeight + 5);
 
         doc.font("Helvetica").fontSize(8).fillColor(COLORS.muted)
-          .text(String(index + 1), A4_COLUMNS[0].x, y + 3, { width: A4_COLUMNS[0].width, lineBreak: false });
-        doc.font("Helvetica").fontSize(8).fillColor(COLORS.ink)
-          .text(itemLines[0], A4_COLUMNS[1].x, y + 2, { width: A4_COLUMNS[1].width, fontSize: 8, lineGap: 1 });
+          .text(String(index + 1), A4_COLUMNS[0].x, y + 2, { width: A4_COLUMNS[0].width, lineBreak: false });
+        doc.font("Helvetica").fontSize(7.5).fillColor(COLORS.ink)
+          .text(itemLines[0], A4_COLUMNS[1].x, y + 1, { width: A4_COLUMNS[1].width, fontSize: 7.5, lineGap: 0.5 });
         if (itemLines[1]) {
-          doc.font("Helvetica").fontSize(7).fillColor(COLORS.muted)
-            .text(itemLines[1], A4_COLUMNS[1].x, y + 3 + doc.heightOfString(itemLines[0], { width: A4_COLUMNS[1].width, fontSize: 8 }), {
+          doc.font("Helvetica").fontSize(6.8).fillColor(COLORS.muted)
+            .text(itemLines[1], A4_COLUMNS[1].x, y + 2 + doc.heightOfString(itemLines[0], { width: A4_COLUMNS[1].width, fontSize: 7.5 }), {
               width: A4_COLUMNS[1].width,
-              fontSize: 7,
-              lineGap: 1,
+              fontSize: 6.8,
+              lineGap: 0.5,
             });
         }
         const values = {
@@ -250,8 +255,8 @@ function buildA4(sale, business, customer) {
           amount: currency(item.subtotal ?? number(item.unitPrice) * number(item.quantity)),
         };
         for (const column of A4_COLUMNS.slice(2)) {
-          doc.font("Helvetica").fontSize(7.5).fillColor(COLORS.ink)
-            .text(values[column.key], column.x, y + 4, {
+          doc.font("Helvetica").fontSize(7.2).fillColor(COLORS.ink)
+            .text(values[column.key], column.x, y + 3, {
               width: column.width,
               align: column.align,
               lineBreak: false,
@@ -260,100 +265,65 @@ function buildA4(sale, business, customer) {
         }
         y += rowHeight;
         doc.moveTo(40, y).lineTo(555, y).strokeColor(COLORS.line).lineWidth(0.45).stroke();
-        y += 3;
+        y += 1.5;
       });
 
       const rows = invoiceRows(sale);
-      const totalsHeight = rows.length * 17 + 23;
-      if (y + totalsHeight > pageBottom) y = addContinuationPage();
-      y += 8;
-      doc.moveTo(330, y).lineTo(555, y).strokeColor(COLORS.line).lineWidth(0.8).stroke();
-      y += 10;
+      const bankDetails = bankDetailEntries(business);
+      const sectionY = y + 7;
+      let summaryY = sectionY + 5;
+      doc.moveTo(330, sectionY).lineTo(555, sectionY).strokeColor(COLORS.line).lineWidth(0.8).stroke();
       for (const [label, value, kind] of rows) {
-        if (kind === "tax-header") {
-          y += 3;
-          doc.moveTo(330, y).lineTo(555, y).strokeColor(COLORS.line).lineWidth(0.5).stroke();
-          y += 6;
-          doc.font("Helvetica-Bold").fontSize(7).fillColor(COLORS.muted)
-            .text(label, 330, y, { width: 225 });
-          y += 13;
-          continue;
-        }
         const bold = kind === "grand" || kind === "due";
         const color = kind === "due" ? (number(sale.dueAmount) > 0 ? COLORS.red : COLORS.green)
           : kind === "credit" ? COLORS.green : COLORS.ink;
-        const rowBold = bold || kind === "tax-total";
-        doc.font(rowBold ? "Helvetica-Bold" : "Helvetica").fontSize(rowBold ? 9 : 8).fillColor(color);
-        doc.text(printable(label), 330, y, { width: 130, fontSize: bold ? 9 : 8 });
-        doc.text(printable(value), 460, y, { width: 95, align: "right", lineBreak: false });
-        y += rowBold ? 18 : 15;
+        const rowBold = bold;
+        const size = rowBold ? 8.5 : 7.2;
+        doc.font(rowBold ? "Helvetica-Bold" : "Helvetica").fontSize(size).fillColor(color);
+        doc.text(printable(label), 330, summaryY, { width: 135, fontSize: size, lineBreak: false });
+        doc.text(printable(value), 465, summaryY, { width: 90, align: "right", fontSize: size, lineBreak: false });
+        summaryY += rowBold ? 13 : 10.5;
       }
 
-      const bankDetails = bankDetailEntries(business);
+      let bankY = sectionY + 7;
       if (bankDetails.length) {
-        y += 9;
-        if (y + 30 > pageBottom) y = addContinuationPage();
-        doc.font("Helvetica-Bold").fontSize(8).fillColor(COLORS.ink).text("BANK DETAILS", 40, y);
-        y += 14;
-        for (let index = 0; index < bankDetails.length; index += 2) {
-          const pair = bankDetails.slice(index, index + 2);
-          const cells = pair.map(([label, value], cellIndex) => {
-            const x = cellIndex === 0 ? 40 : 305;
-            const width = cellIndex === 0 ? 255 : 250;
-            const text = printable(value);
-            doc.font("Helvetica").fontSize(7).fillColor(COLORS.muted);
-            const height = doc.heightOfString(text, { width, fontSize: 7, lineGap: 1 });
-            return { label, text, x, width, height };
-          });
-          const rowHeight = Math.max(...cells.map((cell) => cell.height)) + 15;
-          if (y + rowHeight > pageBottom) {
-            y = addContinuationPage();
-            doc.font("Helvetica-Bold").fontSize(8).fillColor(COLORS.ink).text("BANK DETAILS (CONT.)", 40, y);
-            y += 14;
-          }
-          for (const cell of cells) {
-            doc.font("Helvetica-Bold").fontSize(7).fillColor(COLORS.muted)
-              .text(`${cell.label}:`, cell.x, y, { width: cell.width, lineBreak: false });
-            doc.font("Helvetica").fontSize(7).fillColor(COLORS.ink)
-              .text(cell.text, cell.x, y + 9, { width: cell.width, fontSize: 7, lineGap: 1 });
-          }
-          y += rowHeight;
+        doc.font("Helvetica-Bold").fontSize(7.5).fillColor(COLORS.muted).text("BANK DETAILS", 40, bankY);
+        bankY += 12;
+        for (const [label, value] of bankDetails) {
+          const text = printable(value);
+          const height = doc.heightOfString(text, { width: 190, fontSize: 7.2, lineGap: 0.5 });
+          doc.font("Helvetica-Bold").fontSize(7.2).fillColor(COLORS.muted)
+            .text(`${label}:`, 40, bankY, { width: 76, fontSize: 7.2, lineBreak: false });
+          doc.font("Helvetica").fontSize(7.2).fillColor(COLORS.ink)
+            .text(text, 116, bankY, { width: 190, fontSize: 7.2, lineGap: 0.5 });
+          bankY += Math.max(10, height + 1);
         }
       }
 
+      let termsY = Math.max(summaryY, bankY) + 6;
       const terms = termsForSale(sale);
       if (terms.length) {
-        y += 10;
-        if (y + 35 > pageBottom) y = addContinuationPage();
-        doc.font("Helvetica-Bold").fontSize(8).fillColor(COLORS.ink).text("TERMS AND CONDITIONS", 40, y);
-        y += 13;
+        doc.font("Helvetica-Bold").fontSize(7).fillColor(COLORS.muted).text("TERMS", 40, termsY);
+        termsY += 10;
         for (const [index, term] of terms.entries()) {
           const text = `${index + 1}. ${printable(term)}`;
-          doc.font("Helvetica").fontSize(7.5).fillColor(COLORS.muted);
-          const height = doc.heightOfString(text, { width: 515, fontSize: 7.5, lineGap: 1 });
-          if (y + height > pageBottom) {
-            y = addContinuationPage();
-            doc.font("Helvetica-Bold").fontSize(8).fillColor(COLORS.ink).text("TERMS AND CONDITIONS (CONT.)", 40, y);
-            y += 13;
-          }
-          doc.font("Helvetica").fontSize(7.5).fillColor(COLORS.muted)
-            .text(text, 40, y, { width: 515, fontSize: 7.5, lineGap: 1 });
-          y += height + 4;
+          doc.font("Helvetica").fontSize(7).fillColor(COLORS.muted);
+          const height = doc.heightOfString(text, { width: 515, fontSize: 7, lineGap: 0.5 });
+          doc.text(text, 40, termsY, { width: 515, fontSize: 7, lineGap: 0.5 });
+          termsY += height + 1;
         }
       }
 
-      y += 14;
-      if (y + 50 > pageBottom) y = addContinuationPage() + 5;
-      doc.font("Helvetica").fontSize(8).fillColor(COLORS.muted)
-        .text("Thank you for your business.", 40, y, { width: 260 });
-      doc.moveTo(410, y + 21).lineTo(555, y + 21).strokeColor(COLORS.muted).lineWidth(0.6).stroke();
-      doc.font("Helvetica").fontSize(7).text("Authorized signature", 410, y + 25, { width: 145, align: "center" });
-
-      const pages = doc.bufferedPageRange();
-      for (let index = 0; index < pages.count; index += 1) {
-        doc.switchToPage(pages.start + index);
-        drawA4Footer(doc, index + 1, pages.count, business);
+      const signatureY = Math.max(termsY, bankY, summaryY) + 8;
+      const contentBottom = doc.page.height - 58;
+      if (signatureY + 35 > contentBottom) {
+        throw new Error("Invoice content exceeds the one-page A4 printable area.");
       }
+      doc.font("Helvetica").fontSize(8).fillColor(COLORS.muted)
+        .text("Thank you for your business.", 40, signatureY, { width: 260, lineBreak: false });
+      doc.moveTo(410, signatureY + 18).lineTo(555, signatureY + 18).strokeColor(COLORS.muted).lineWidth(0.6).stroke();
+      doc.font("Helvetica").fontSize(7).text("Authorized signature", 410, signatureY + 21, { width: 145, align: "center", lineBreak: false });
+      drawA4Footer(doc, 1, 1, business);
       doc.end();
     } catch (error) {
       reject(error);

@@ -34,6 +34,12 @@ const invoice = {
 test("A4 browser print escapes data and uses saved payments, balance, and terms", () => {
   const html = buildInvoicePrintHtml(invoice, "a4");
   assert.match(html, /@page \{ size: A4/);
+  assert.match(html, /@page \{ size: A4 portrait; margin: 10mm; \}/);
+  assert.match(html, /grid-template-columns: minmax\(0, 1fr\) minmax\(72mm, 88mm\)/);
+  assert.match(html, /Authorized signature/);
+  assert.match(html, /height:277mm/);
+  assert.match(html, /printableHeight-2/);
+  assert.match(html, /too long to print on one A4 page/);
   assert.match(html, /Test Customer &lt;script&gt;alert\(1\)&lt;\/script&gt;/);
   assert.doesNotMatch(html, /<script>alert\(1\)<\/script>/);
   assert.match(html, /Cash/);
@@ -51,7 +57,7 @@ test("thermal browser layouts use dedicated narrow widths", () => {
   assert.match(buildInvoicePrintHtml(invoice, "thermal58"), /size: 58mm auto/);
 });
 
-test("A4 and thermal print invoices show optional bank details and tax placeholders", () => {
+test("A4 and thermal print invoices show optional bank details and existing tax entries only", () => {
   for (const format of ["a4", "thermal80", "thermal58"]) {
     const html = buildInvoicePrintHtml({
       ...invoice,
@@ -65,22 +71,31 @@ test("A4 and thermal print invoices show optional bank details and tax placehold
           branchName: "Main Branch",
         },
       },
-      items: [{ ...invoice.items[0], taxAmount: 12, taxRate: 6 }],
       taxBreakdown: [{ label: "CGST", amount: 6 }, { label: "SGST", amount: 6 }],
     }, format);
     assert.match(html, /Bank details/);
     for (const value of ["Example Bank", "Example Holder", "001234", "EXAM0001234", "Main Branch"]) {
       assert.ok(html.includes(value), `${format}: missing ${value}`);
     }
-    assert.match(html, /Taxable amount/);
     assert.match(html, /CGST/);
     assert.match(html, /SGST/);
-    assert.match(html, /IGST/);
-    assert.match(html, /Total tax/);
     assert.ok(html.indexOf("TAX SUMMARY") < html.indexOf("Grand total"));
     assert.doesNotMatch(html, /<th[^>]*>Tax<\/th>/);
     assert.doesNotMatch(html, /Tax - item/);
     assert.match(html, /Rs\. 85\.00/);
+    if (format !== "a4") assert.match(html, /\.invoice-bottom \{ display: flex; flex-direction: column-reverse; \}/);
+  }
+});
+
+test("browser print omits tax presentation when no saved breakdown exists", () => {
+  const html = buildInvoicePrintHtml(invoice, "a4");
+  assert.doesNotMatch(html, /TAX SUMMARY|CGST|SGST|IGST|Not recorded/);
+});
+
+test("thermal browser layouts do not apply the A4 page-length guard", () => {
+  for (const format of ["thermal80", "thermal58"]) {
+    const html = buildInvoicePrintHtml(invoice, format);
+    assert.doesNotMatch(html, /too long to print on one A4 page/);
   }
 });
 
@@ -102,7 +117,7 @@ test("browser print hides empty bank details and contains logos in consistent fr
     }, format);
     assert.match(html, /object-fit: contain/);
     assert.match(html, /object-position: center/);
-    assert.match(html, /width: (20|25)mm; height: \1mm/);
+    assert.match(html, /width: (19|20)mm; height: \1mm/);
     assert.match(html, /background: #fff/);
   }
 });

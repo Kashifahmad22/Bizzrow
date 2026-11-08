@@ -84,24 +84,90 @@ function pageCount(pdf) {
   return (pdf.toString("latin1").match(/\/Type\s*\/Page\b/g) || []).length;
 }
 
-test("A4 invoice is a PDF and paginates large catalogues with saved totals", async () => {
-  const sale = fixture({ items: Array.from({ length: 80 }, (_, index) => ({
+test("A4 invoice fits one standard page with multiple rows and saved totals", async () => {
+  const sale = fixture({ items: Array.from({ length: 10 }, (_, index) => ({
     ...fixture().items[0],
-    name: `Long product ${index + 1} - ${"detailed item description ".repeat(3)}`,
+    name: `Product ${index + 1} - premium cotton shirt`,
   })) });
-  const pdf = await buildInvoicePdfDocument(sale, { name: "Test Business", gstNumber: "TESTGST" }, {
-    name: "Test Customer",
+  const pdf = await buildInvoicePdfDocument(sale, {
+    name: "The Central Market Family Apparel and Textile Wholesale Store",
+    logo: logoDataUrl(80, 32),
+    gstNumber: "TESTGST",
+    bankDetails: {
+      bankName: "Example Bank",
+      accountHolderName: "Test Business",
+      accountNumber: "001234567890",
+      ifscCode: "EXAM0001234",
+      branchName: "Central Market Branch",
+    },
+  }, {
+    name: "The Central Market Family Garments and Textile Retail Customer",
     phone: "9000000000",
-    address: "Test billing address",
+    address: "Long customer billing address, Central Market Road, New Delhi, India, near the old wholesale market",
   });
-
   assert.equal(pdf.subarray(0, 5).toString(), "%PDF-");
   assert.match(pdf.toString("latin1"), /595\.28\s+841\.89/);
-  assert.ok(pageCount(pdf) > 1);
+  assert.equal(pageCount(pdf), 1);
   assert.deepEqual(invoiceRows(fixture()).filter((row) => row[0] === "Grand total")[0], ["Grand total", "Rs. 202.50", "grand"]);
   assert.ok(invoiceRows(fixture()).some((row) => row[0] === "Cash" && row[1] === "Rs. 100.00"));
   assert.ok(invoiceRows(fixture()).some((row) => row[0] === "UPI" && row[1] === "Rs. 50.00"));
   assert.ok(invoiceRows(fixture()).some((row) => row[0] === "Outstanding balance" && row[1] === "Rs. 52.50"));
+});
+
+test("A4 one-page output remains valid with partial or missing banking and no logo", async () => {
+  for (const bankDetails of [undefined, { bankName: "Example Bank" }]) {
+    const pdf = await buildInvoicePdfDocument(
+      fixture(),
+      { name: "Test Business", bankDetails },
+      { name: "Test Customer", address: "Test address" }
+    );
+    assert.equal(pageCount(pdf), 1);
+    assert.match(pdf.toString("latin1"), /595\.28\s+841\.89/);
+  }
+});
+
+test("A4 overflow is rejected instead of spilling invoice content onto a second page", async () => {
+  const sale = fixture({ items: Array.from({ length: 80 }, (_, index) => ({
+    ...fixture().items[0],
+    name: `Long product ${index + 1} - ${"detailed item description ".repeat(3)}`,
+  })) });
+  await assert.rejects(
+    buildInvoicePdfDocument(sale, { name: "Test Business" }, { name: "Test Customer" }),
+    /exceeds the one-page A4 printable area/
+  );
+});
+
+test("A4 long business and customer names do not overlap profile details", async () => {
+  const originalText = PDFDocument.prototype.text;
+  const calls = [];
+  PDFDocument.prototype.text = function (text, x, y, options) {
+    const result = originalText.call(this, text, x, y, options);
+    calls.push({ text: String(text), start: y, end: this.y });
+    return result;
+  };
+  try {
+    const sale = fixture({
+      customerName: "The Central Market Family Garments and Textile Retail Customer",
+    });
+    const pdf = await buildInvoicePdfDocument(sale, {
+      name: "The Central Market Family Apparel and Textile Wholesale Store",
+      logo: logoDataUrl(80, 32),
+      address: "Long business address, Central Market Road, New Delhi, India",
+      phone: "9000000000",
+    }, {
+      name: sale.customerName,
+      address: "Long customer billing address, Central Market Road, New Delhi, India",
+    });
+    assert.equal(pageCount(pdf), 1);
+    const businessName = calls.find((call) => call.text.startsWith("The Central Market Family Apparel"));
+    const businessAddress = calls.find((call) => call.text.startsWith("Long business address"));
+    assert.ok(businessName.end <= businessAddress.start);
+    const customerName = calls.find((call) => call.text === sale.customerName);
+    const customerAddress = calls.find((call) => call.text.startsWith("Long customer billing address"));
+    assert.ok(customerName.end <= customerAddress.start);
+  } finally {
+    PDFDocument.prototype.text = originalText;
+  }
 });
 
 test("80mm and 58mm invoices use narrow receipt page widths", async () => {
@@ -174,22 +240,28 @@ test("thermal rows reserve space for wrapped labels and amounts", async () => {
   }
 });
 
-test("tax summary placeholders precede the saved grand total without changing it", () => {
-  const rows = invoiceRows(fixture());
-  assert.ok(rows.some((row) => row[0] === "Bill discount (10%)" && row[1] === "- Rs. 22.50"));
-  const taxHeader = rows.findIndex((row) => row[0] === "TAX SUMMARY");
-  const total = rows.findIndex((row) => row[0] === "Grand total");
+test("tax summary is omitted without saved breakdown and uses only existing tax entries", () => {
+  const withoutTax = invoiceRows(fixture());
+  assert.equal(withoutTax.some((row) => row[2] === "tax" || row[2] === "tax-header"), false);
+  assert.equal(withoutTax.find((row) => row[0] === "Grand total")[1], "Rs. 202.50");
+
+  const withTax = invoiceRows(fixture({
+    taxBreakdown: [
+      { label: "CGST", amount: 6 },
+      { label: "SGST", taxAmount: 6 },
+      { label: "Invalid", amount: null },
+    ],
+  }));
+  const taxHeader = withTax.findIndex((row) => row[0] === "TAX SUMMARY");
+  const total = withTax.findIndex((row) => row[0] === "Grand total");
   assert.ok(taxHeader >= 0 && taxHeader < total);
-  assert.deepEqual(rows.slice(taxHeader, total), [
+  assert.deepEqual(withTax.slice(taxHeader, total), [
     ["TAX SUMMARY", "", "tax-header"],
-    ["Taxable amount", "Not recorded", "tax"],
-    ["CGST", "—", "tax"],
-    ["SGST", "—", "tax"],
-    ["IGST", "—", "tax"],
-    ["Total tax", "Not recorded", "tax-total"],
+    ["CGST", "Rs. 6.00", "tax"],
+    ["SGST", "Rs. 6.00", "tax"],
   ]);
-  assert.equal(rows[total][1], "Rs. 202.50");
-  assert.ok(rows.some((row) => row[0] === "Outstanding balance" && row[1] === "Rs. 52.50"));
+  assert.equal(withTax[total][1], "Rs. 202.50");
+  assert.ok(withTax.some((row) => row[0] === "Outstanding balance" && row[1] === "Rs. 52.50"));
 });
 
 test("legacy zero-default subtotal falls back to saved sale total and recorded adjustments are shown", () => {
@@ -213,7 +285,7 @@ test("legacy zero-default subtotal falls back to saved sale total and recorded a
 test("PDF invoice formats fit square, landscape, and portrait logos without stretching", async () => {
   const originalImage = PDFDocument.prototype.image;
   const cases = [
-    { width: 40, height: 40, format: "a4", fit: [58, 52] },
+    { width: 40, height: 40, format: "a4", fit: [54, 48] },
     { width: 80, height: 32, format: "thermal80", fit: [180.77, 28] },
     { width: 32, height: 80, format: "thermal58", fit: [126.41, 24] },
   ];
@@ -245,18 +317,23 @@ test("bank details render completely, partially, or not at all across PDF format
   const capture = async (format, bankDetails) => {
     const calls = [];
     PDFDocument.prototype.text = function (text, ...args) {
-      calls.push(String(text));
-      return originalText.call(this, text, ...args);
+      const result = originalText.call(this, text, ...args);
+      calls.push({ text: String(text), end: this.y, pageHeight: this.page.height });
+      return result;
     };
     try {
       const pdf = await buildInvoicePdfDocument(
         fixture(),
-        { name: "Test Business", bankDetails },
-        {},
+        {
+          name: "Test Business",
+          bankDetails,
+          logo: format === "a4" ? logoDataUrl(40, 40) : "",
+        },
+        { name: "Long customer name for invoice layout coverage", address: "Long customer billing address, Main Road, New Delhi" },
         { format }
       );
       assert.equal(pdf.subarray(0, 5).toString(), "%PDF-");
-      return calls.join("\n");
+      return { pdf, calls, text: calls.map((call) => call.text).join("\n") };
     } finally {
       PDFDocument.prototype.text = originalText;
     }
@@ -271,27 +348,35 @@ test("bank details render completely, partially, or not at all across PDF format
         ifscCode: "EXAM0001234",
         branchName: "Main Branch",
       });
-      assert.match(complete, /BANK DETAILS/);
+      assert.match(complete.text, /BANK DETAILS/);
+      if (format === "a4") {
+        assert.equal(pageCount(complete.pdf), 1);
+        assert.ok(complete.text.includes("Thank you for your business."));
+        assert.ok(complete.text.includes("Authorized signature"));
+        assert.ok(complete.calls.every((call) => call.end <= call.pageHeight - 8),
+          "all A4 text must remain clear of the page edge");
+      }
       for (const value of ["Example Bank", "Example Holder", "001234", "EXAM0001234", "Main Branch"]) {
-        assert.ok(complete.includes(value), `${format}: missing ${value}`);
+        assert.ok(complete.text.includes(value), `${format}: missing ${value}`);
       }
 
       const partial = await capture(format, { bankName: "Partial Bank" });
-      assert.match(partial, /Partial Bank/);
-      assert.doesNotMatch(partial, /Account holder:|Account number:|IFSC:|Branch:/);
+      assert.match(partial.text, /Partial Bank/);
+      assert.doesNotMatch(partial.text, /Account holder:|Account number:|IFSC:|Branch:/);
+      if (format === "a4") assert.equal(pageCount(partial.pdf), 1);
 
       const missing = await capture(format, undefined);
-      assert.doesNotMatch(missing, /BANK DETAILS/);
+      assert.doesNotMatch(missing.text, /BANK DETAILS/);
+      if (format === "a4") assert.equal(pageCount(missing.pdf), 1);
     }
   } finally {
     PDFDocument.prototype.text = originalText;
   }
 });
 
-test("legacy item tax values are not shown in invoice lines and totals stay saved", async () => {
+test("tax recording is not inferred from item values and saved totals remain unchanged", async () => {
   const sale = fixture({
     items: [{ ...fixture().items[0], taxAmount: 12, taxRate: 6 }],
-    taxBreakdown: [{ label: "CGST", amount: 6 }, { label: "SGST", amount: 6 }],
   });
   const originalText = PDFDocument.prototype.text;
   const renderedText = [];
@@ -304,7 +389,7 @@ test("legacy item tax values are not shown in invoice lines and totals stay save
   } finally {
     PDFDocument.prototype.text = originalText;
   }
-  assert.equal(renderedText.some((text) => /Tax \(6%\)|item 1/.test(text)), false);
+  assert.equal(renderedText.some((text) => /CGST|SGST|IGST|Tax \(6%\)|item 1/.test(text)), false);
   const rows = invoiceRows(sale);
   assert.equal(rows.find((row) => row[0] === "Grand total")[1], "Rs. 202.50");
 });
