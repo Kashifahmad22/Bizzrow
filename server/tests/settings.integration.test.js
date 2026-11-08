@@ -7,20 +7,15 @@ const mongoose = require("mongoose");
 const User = require("../models/User");
 const settingsRoutes = require("../routes/settings");
 const { errorHandler } = require("../middleware/error");
+const { connectIsolatedMongo } = require("./helpers/isolatedMongo");
 
 const uri = process.env.FINANCIAL_TEST_MONGO_URI;
 
 test("business banking details persist only to the authenticated tenant", {
   skip: uri ? false : "Set FINANCIAL_TEST_MONGO_URI to an isolated test replica-set database",
-}, async () => {
-  const parsed = new URL(uri);
-  const database = decodeURIComponent(parsed.pathname.replace(/^\/+/, ""));
-  if (!["localhost", "127.0.0.1", "[::1]"].includes(parsed.hostname.toLowerCase())
-      || !/(^test|[-_]test|testing)/i.test(database)) {
-    throw new Error("Settings integration tests require a loopback test database");
-  }
-
-  await mongoose.connect(uri, { autoIndex: false });
+}, async (t) => {
+  t.after(() => mongoose.disconnect());
+  await connectIsolatedMongo(uri, [User]);
   const ownerA = new mongoose.Types.ObjectId();
   const ownerB = new mongoose.Types.ObjectId();
   const previousSecret = process.env.JWT_SECRET;

@@ -13,19 +13,16 @@ const LedgerEntry = require("../models/LedgerEntry");
 const Counter = require("../models/Counter");
 const { idempotencyIdentity } = require("../services/financialTransaction");
 const { errorHandler } = require("../middleware/error");
+const StockBatch = require("../models/StockBatch");
+const { connectIsolatedMongo } = require("./helpers/isolatedMongo");
 
 const uri = process.env.FINANCIAL_TEST_MONGO_URI;
 
 test("cash tender persists net collections through sales, retries, returns and replacement", {
   skip: uri ? false : "Set FINANCIAL_TEST_MONGO_URI to an isolated test replica-set database",
-}, async () => {
-  const parsed = new URL(uri);
-  const db = decodeURIComponent(parsed.pathname.replace(/^\/+/, ""));
-  if (!["localhost", "127.0.0.1", "[::1]"].includes(parsed.hostname.toLowerCase())
-      || !/(^test|[-_]test|testing)/i.test(db)) {
-    throw new Error("Route integration tests require a loopback test database");
-  }
-  await mongoose.connect(uri, { autoIndex: false });
+}, async (t) => {
+  t.after(() => mongoose.disconnect());
+  await connectIsolatedMongo(uri, [User, Product, StockBatch, Customer, Sale, ReturnRecord, LedgerEntry, Counter]);
   const ownerId = new mongoose.Types.ObjectId();
   const secret = process.env.JWT_SECRET;
   process.env.JWT_SECRET = crypto.randomUUID();

@@ -12,11 +12,11 @@ const saleItemSchema = new mongoose.Schema(
     retailPrice: { type: Number, min: 0 },
     batchAllocations: [{
       batch: { type: mongoose.Schema.Types.ObjectId, ref: "StockBatch", required: true },
-      quantity: { type: Number, required: true, min: 0.000001 },
+      quantity: { type: Number, required: true, min: 0 },
       costPrice: { type: Number, default: null, min: 0 },
     }],
     legacyQuantityFirst: { type: Number, default: 0, min: 0 },
-    quantity: { type: Number, required: true, min: 1 },
+    quantity: { type: Number, required: true, min: 0 },
     unitPrice: { type: Number, required: true, min: 0 },
     // Item-level discount (Master Sprint). Backward compatible: defaults to none.
     discountType: { type: String, enum: ["percent", "amount"], default: "amount" },
@@ -24,7 +24,7 @@ const saleItemSchema = new mongoose.Schema(
     discountAmount: { type: Number, default: 0, min: 0 }, // computed ₹ off this line
     gross: { type: Number, default: 0, min: 0 }, // unitPrice * quantity (before discount)
     subtotal: { type: Number, required: true, min: 0 }, // net (after item discount)
-    costPrice: { type: Number, default: 0, min: 0 }, // cost snapshot at sale time (profit engine)
+    costPrice: { type: Number, min: 0 }, // cost snapshot at sale time (profit engine)
     returnedQty: { type: Number, default: 0, min: 0 }, // units returned (returns v1)
   },
   { _id: false }

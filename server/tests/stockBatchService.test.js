@@ -126,7 +126,7 @@ test("adding a batch atomically increases aggregate stock by the received quanti
     },
     async updateOne(filter, update) {
       productFilter = filter;
-      product.stock += update.$inc.stock;
+      product.stock = update.$set.stock;
       return { modifiedCount: 1 };
     },
   };
@@ -217,7 +217,7 @@ test("return restoration credits the originating batch without exceeding receive
     ),
     async updateOne(filter, update) {
       updates.push(filter);
-      batch.remainingQuantity += update.$inc.remainingQuantity;
+      batch.remainingQuantity = update.$set.remainingQuantity;
       return { modifiedCount: 1 };
     },
   };

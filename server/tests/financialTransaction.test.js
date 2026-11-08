@@ -9,6 +9,7 @@ const {
   isUnsupportedTransactionError,
   requestFingerprint,
   requireIdempotencyKey,
+  resourceIdempotency,
 } = require("../services/financialTransaction");
 
 test("failed preparation performs no writes and allows corrected retry with the same key", async () => {
@@ -46,7 +47,7 @@ test("failed preparation performs no writes and allows corrected retry with the 
     assert.equal(records.size, 0);
     assert.equal(await run(290), 290);
     assert.equal(writes, 2);
-    assert.equal(await run(290), "sale-id");
+    assert.equal(await run(290), 290);
     assert.equal(writes, 2);
     await assert.rejects(run(291), (error) => error.status === 409);
   } finally {
@@ -88,7 +89,7 @@ test("rejected reviewed prices leave the key unused for a corrected retry", asyn
     assert.equal(writes, 0);
     assert.equal(records.size, 0);
     assert.equal(await run(110), "created");
-    assert.equal(await run(110), "sale-id");
+    assert.equal(await run(110), "created");
     assert.equal(writes, 2);
   } finally {
     mongoose.startSession = originalStart;
@@ -129,4 +130,36 @@ test("MongoDB transaction capability errors are recognized explicitly", () => {
     message: "Transaction numbers are only allowed on a replica set member or mongos",
   }), true);
   assert.equal(isUnsupportedTransactionError(new Error("network timeout")), false);
+});
+
+test("resource idempotency canonicalizes route IDs and preserves isolation and payload conflicts", () => {
+  const input = {
+    resourceId: "abcdefabcdefabcdefabcdef", operation: "ledger-payment",
+    fingerprintOperation: "ledger:payment", parameter: "customerId", body: { amount: 10 },
+  };
+  const lower = resourceIdempotency(input);
+  const upper = resourceIdempotency({ ...input, resourceId: input.resourceId.toUpperCase() });
+  assert.equal(lower.operation, upper.operation);
+  assert.equal(lower.fingerprint, upper.fingerprint);
+  assert.notEqual(lower.fingerprint, resourceIdempotency({ ...input, body: { amount: 11 } }).fingerprint);
+  assert.notEqual(lower.operation, resourceIdempotency({ ...input, resourceId: "abcdefabcdefabcdefabcdea" }).operation);
+  assert.notEqual(idempotencyIdentity("a", lower.operation, "same-key"), idempotencyIdentity("b", lower.operation, "same-key"));
+  assert.notEqual(lower.operation, resourceIdempotency({ ...input, operation: "sale-return" }).operation);
+  for (const invalid of ["", "not-an-id", "g".repeat(24), "a".repeat(23), null]) {
+    assert.throws(() => resourceIdempotency({ ...input, resourceId: invalid }), (error) => error.status === 400);
+  }
+});
+
+test("test MongoDB URI validation rejects unsafe or ambiguous targets", () => {
+  const { validateTestUri } = require("./helpers/isolatedMongo");
+  const good = "mongodb://127.0.0.1:27017/bizzrow_test?directConnection=true&replicaSet=rs";
+  assert.doesNotThrow(() => validateTestUri(good));
+  for (const uri of [
+    "mongodb://example.com/bizzrow_test?directConnection=true&replicaSet=rs",
+    "mongodb://127.0.0.1/production?directConnection=true&replicaSet=rs",
+    "mongodb://127.0.0.1/bizzrow_test?replicaSet=rs",
+    `${good}&dbName=production`,
+    `${good}&replicaSet=other`,
+    "mongodb://production:password@127.0.0.1/bizzrow_test?directConnection=true&replicaSet=rs",
+  ]) assert.throws(() => validateTestUri(uri));
 });

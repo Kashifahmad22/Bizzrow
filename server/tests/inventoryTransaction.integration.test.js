@@ -9,19 +9,15 @@ const { addStockBatch, restoreBatchStock, returnedBatchAllocations } = require("
 const { adjustStock } = require("../services/stockAdjustment");
 const { decrementStock } = require("../services/stockService");
 const { runFinancialTransaction, executeIdempotently, idempotencyIdentity, requestFingerprint } = require("../services/financialTransaction");
+const { connectIsolatedMongo } = require("./helpers/isolatedMongo");
 
 const uri = process.env.FINANCIAL_TEST_MONGO_URI;
 
 test("isolated inventory transactions reconcile batches, returns, adjustments, rollback and retries", {
   skip: uri ? false : "Set FINANCIAL_TEST_MONGO_URI to an isolated test replica-set database",
-}, async () => {
-  const parsed = new URL(uri);
-  const name = decodeURIComponent(parsed.pathname.replace(/^\/+/, ""));
-  if (!["localhost", "127.0.0.1", "[::1]"].includes(parsed.hostname.toLowerCase())
-      || !/(^test|[-_]test|testing)/i.test(name)) {
-    throw new Error("Inventory integration tests require a loopback test database");
-  }
-  await mongoose.connect(uri, { autoIndex: false });
+}, async (t) => {
+  t.after(() => mongoose.disconnect());
+  await connectIsolatedMongo(uri, [Product, StockBatch, StockAdjustment, Counter]);
   const ownerId = new mongoose.Types.ObjectId();
   const productId = new mongoose.Types.ObjectId();
   const operation = "inventory-adjustment-test";

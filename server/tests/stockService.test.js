@@ -5,6 +5,7 @@ const { decrementStock, getStockRequirements } = require("../services/stockServi
 test("duplicate product lines are consolidated before decrement", async () => {
   const updates = [];
   const Product = {
+    findOne: async () => ({ stock: 10, soldCount: 0 }),
     async updateOne(filter, update) {
       updates.push({ filter, update });
       return { modifiedCount: 1 };
@@ -24,17 +25,17 @@ test("duplicate product lines are consolidated before decrement", async () => {
     { product: "product-a", quantity: 3 },
   ])], [["product-a", 5]]);
   assert.equal(updates.length, 1);
-  assert.equal(updates[0].filter.stock.$gte, 5);
-  assert.equal(updates[0].update.$inc.stock, -5);
+  assert.equal(updates[0].filter.stock, 10);
+  assert.equal(updates[0].update.$set.stock, 5);
 });
 
 test("conditional updates prevent concurrent sales from overselling stock", async () => {
   let stock = 5;
   const Product = {
-    async updateOne(filter) {
-      const required = filter.stock.$gte;
-      if (stock < required) return { matchedCount: 0, modifiedCount: 0 };
-      stock -= required;
+    findOne: async () => ({ stock }),
+    async updateOne(filter, update) {
+      if (stock !== filter.stock) return { matchedCount: 0, modifiedCount: 0 };
+      stock = update.$set.stock;
       return { matchedCount: 1, modifiedCount: 1 };
     },
   };
@@ -52,6 +53,7 @@ test("conditional updates prevent concurrent sales from overselling stock", asyn
 
 test("stock failures are explicit for transaction rollback", async () => {
   const Product = {
+    findOne: async () => ({ stock: 10 }),
     async updateOne() {
       return { matchedCount: 0, modifiedCount: 0 };
     },
@@ -80,8 +82,9 @@ test("FIFO batch deduction records batch costs and reconciles total stock", asyn
   const Product = {
     findOne: () => query(product),
     async updateOne(filter, update) {
-      if (product.stock < filter.stock.$gte) return { modifiedCount: 0 };
-      product.stock += update.$inc.stock;
+      if (product.stock !== filter.stock) return { modifiedCount: 0 };
+      product.stock = update.$set.stock;
+      product.soldCount = update.$set.soldCount;
       return { modifiedCount: 1 };
     },
   };
@@ -89,8 +92,8 @@ test("FIFO batch deduction records batch costs and reconciles total stock", asyn
     find: () => query(batches.filter((batch) => batch.remainingQuantity > 0)),
     async updateOne(filter, update) {
       const batch = batches.find((item) => item._id === filter._id);
-      if (!batch || batch.remainingQuantity < filter.remainingQuantity.$gte) return { modifiedCount: 0 };
-      batch.remainingQuantity += update.$inc.remainingQuantity;
+      if (!batch || batch.remainingQuantity !== filter.remainingQuantity) return { modifiedCount: 0 };
+      batch.remainingQuantity = update.$set.remainingQuantity;
       return { modifiedCount: 1 };
     },
   };
@@ -139,7 +142,7 @@ test("products without batch history continue to sell from legacy stock", async 
   const Product = {
     findOne: () => query(product),
     async updateOne(_filter, update) {
-      product.stock += update.$inc.stock;
+      product.stock = update.$set.stock;
       return { modifiedCount: 1 };
     },
   };

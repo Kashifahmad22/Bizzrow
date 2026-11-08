@@ -63,16 +63,70 @@ function requireIdempotencyKey(req) {
   return key;
 }
 
-async function executeIdempotently({ ownerId, operation, key, fingerprint, prepare, work, replay }) {
+function resourceIdempotency({ resourceId, operation, fingerprintOperation, parameter, body }) {
+  if (typeof resourceId !== "string" || !/^[0-9a-f]{24}$/i.test(resourceId)) {
+    throw httpError(400, "Invalid resource ID");
+  }
+  const canonicalId = resourceId.toLowerCase();
+  return {
+    resourceId: canonicalId,
+    operation: `${operation}:${canonicalId}`,
+    fingerprint: requestFingerprint(fingerprintOperation, { [parameter]: canonicalId }, body),
+    resource: { id: canonicalId, operation, fingerprintOperation, parameter, body },
+  };
+}
+
+function resourceIdentityPattern(ownerId, key, resource) {
+  const escaped = (value) => String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const identity = idempotencyIdentity(ownerId, `${resource.operation}:${resource.id}`, key);
+  const prefix = `idempotency:${resource.operation}:`;
+  const suffix = identity.slice(prefix.length + resource.id.length);
+  const idPattern = [...resource.id].map((c) => /[a-f]/.test(c) ? `[${c}${c.toUpperCase()}]` : c).join("");
+  return new RegExp(`^${escaped(prefix)}${idPattern}${escaped(suffix)}$`);
+}
+
+async function findResourceRecord(ownerId, key, resource, session) {
+  let query = Counter.find({ _id: resourceIdentityPattern(ownerId, key, resource) }).limit(2);
+  if (session) query = query.session(session);
+  const records = await query;
+  if (records.length > 1) {
+    throw httpError(409, "Multiple historical idempotency records exist for this resource and key; manual review is required");
+  }
+  return records[0];
+}
+
+function checkResourceFingerprint(record, fingerprint, resource) {
+  const prefix = `idempotency:${resource.operation}:`;
+  const originalId = record._id.slice(prefix.length, prefix.length + 24);
+  const legacyFingerprint = requestFingerprint(resource.fingerprintOperation, { [resource.parameter]: originalId }, resource.body);
+  if (record.requestHash !== fingerprint && record.requestHash !== legacyFingerprint) {
+    throw httpError(409, "Idempotency-Key was already used for a different request");
+  }
+}
+
+async function executeIdempotently({ ownerId, operation, key, fingerprint, resource, prepare, work, replay, replaySnapshot }) {
   const identity = idempotencyIdentity(ownerId, operation, key);
+  const findExisting = (session) => resource
+    ? findResourceRecord(ownerId, key, resource, session)
+    : session ? Counter.findById(identity).session(session) : Counter.findById(identity);
+  const checkExisting = (record) => {
+    if (resource) checkResourceFingerprint(record, fingerprint, resource);
+    else if (record.requestHash !== fingerprint) {
+      throw httpError(409, "Idempotency-Key was already used for a different request");
+    }
+  };
+  const replayResult = (record) => {
+    if (record.responseSnapshot !== undefined) {
+      return replaySnapshot ? replaySnapshot(record.responseSnapshot) : record.responseSnapshot;
+    }
+    return replay(record);
+  };
   let outcome;
   try {
     outcome = await runFinancialTransaction(async (session) => {
-      const existing = await Counter.findById(identity).session(session);
+      const existing = await findExisting(session);
       if (existing) {
-        if (existing.requestHash !== fingerprint) {
-          throw httpError(409, "Idempotency-Key was already used for a different request");
-        }
+        checkExisting(existing);
         return { replayed: true, record: existing };
       }
 
@@ -86,20 +140,19 @@ async function executeIdempotently({ ownerId, operation, key, fingerprint, prepa
       record.resultType = result.resultType;
       record.resultId = result.resultId;
       record.relatedResourceId = result.relatedResourceId || null;
+      record.responseSnapshot = JSON.parse(JSON.stringify(result.value));
       await record.save({ session });
       return { replayed: false, value: result.value };
     });
   } catch (error) {
     if (error?.code !== 11000) throw error;
-    const existing = await Counter.findById(identity);
+    const existing = await findExisting();
     if (!existing) throw error;
-    if (existing.requestHash !== fingerprint) {
-      throw httpError(409, "Idempotency-Key was already used for a different request");
-    }
-    return replay(existing);
+    checkExisting(existing);
+    return replayResult(existing);
   }
 
-  if (outcome.replayed) return replay(outcome.record);
+  if (outcome.replayed) return replayResult(outcome.record);
   return outcome.value;
 }
 
@@ -109,5 +162,6 @@ module.exports = {
   isUnsupportedTransactionError,
   requestFingerprint,
   requireIdempotencyKey,
+  resourceIdempotency,
   runFinancialTransaction,
 };

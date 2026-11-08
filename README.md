@@ -175,6 +175,21 @@ paise. The server compares these against its prepared item prices and quantities
 and rejects missing, duplicate, unexpected, or changed lines before reserving
 the idempotency key. The snapshot is only a comparison and never sets sale
 prices. Existing callers may omit it.
+New sale, replacement, received-batch, stock-adjustment and opening-stock
+quantities allow up to three decimal places. Returns of older sale lines whose
+stored quantities have greater precision may use that historical precision.
+Stock and return arithmetic uses decimal operations without rounding historical
+balances to three places. Quantities remain stored as MongoDB numbers: if an
+exact result cannot be represented without losing decimal digits, the
+operation fails and requires reconciliation rather than silently rounding.
+For a historical returned quantity that cannot be subtracted safely, a return
+can proceed only when one sale line exists for the product and ordered prior
+return records independently reproduce the stored floating-point accumulation.
+Their exact decimal sum is then used for the new return; the new return record
+captures both the prior stored value and the verified sum. Prior return records
+are not changed. Missing, ambiguous or unsafe history requires reconciliation.
+The historical precision exception does not exceed the precision recorded on
+the applicable sale line or its prior returned quantity.
 Requests with `cashTendered`, `expectedTotal`, `reviewedItems`, or a sale type
 use server product prices. For compatibility, legacy requests omitting all
 four can still supply an item `unitPrice`; those callers do not have the same
@@ -188,6 +203,72 @@ attempt first.
 These financial writes require a MongoDB replica set or sharded cluster with
 transaction support. The API returns an error rather than writing partially if
 transactions are unavailable.
+
+Resource-specific idempotency scopes use canonical lowercase MongoDB ObjectIds.
+Retries also look up records written with earlier mixed-case route IDs. If more
+than one historical record exists for the same owner, resource, operation and
+key, the request fails with a conflict and requires manual review; no historical
+records are changed. Old application instances can still create mixed-case
+records concurrently, so drain old writers before enabling this change rather
+than running mixed versions together.
+New idempotency records also retain a JSON response snapshot in the transaction,
+so replay does not reflect later changes to the customer, sale or stock. Older
+records do not contain snapshots and retain their prior live-resource replay
+behavior; their original response cannot be reconstructed. Legacy batch retries
+are checked against their recorded key and fingerprint before new quantity
+validation is applied.
+
+Checkout and replacement unit prices and flat discounts, and checkout,
+replacement and ledger payment amounts, must be non-negative currency values
+with at most two decimal places. A saved product price with greater precision
+must be corrected before it can be used for a sale. Percentage discounts are
+not currency amounts. Returned values are computed from the recorded sale, not
+entered as client refund amounts.
+Fractional line values and percentage discounts use decimal half-up rounding
+to paise; the checkout and return previews apply the same rounding rule.
+
+Customers with a recorded sale, ledger entry, return, or nonzero financial
+balance/totals cannot be deleted. Deletion of an unused customer is performed
+transactionally so it cannot race with a transaction updating that customer.
+Collection analytics totals aggregate the entire selected date range; the
+displayed detail records remain limited to the latest 100 source records per
+category, so their sum need not equal the full total.
+New return ledger entries retain the due reduction as their signed balance
+amount and include refund or replacement-settlement information in their note;
+refund-only entries have a zero balance effect. Earlier entries are not changed.
+
+Inventory value in dashboard and health calculations currently uses aggregate
+product stock multiplied by the product's current cost, rounded to whole rupees;
+it does not use batch cost snapshots. For example, 4 units at a batch cost of
+₹5 and 6 at ₹10 have batch value ₹80, while a current product cost of ₹7
+produces ₹70. A batch-cost valuation would need an explicit policy for
+unbatched stock and batches with unknown cost; weighted-average valuation is
+another alternative. The current methodology has not been changed.
+
+#### Isolated financial integration tests
+
+These tests must only target a disposable, single-node MongoDB replica set,
+never a business or production server. The harness requires an explicit
+loopback URI with the database name `bizzrow_test`, `directConnection=true`,
+and `replicaSet`. It creates a new randomly named `bizzrow_test_<id>` database
+per test process, verifies that it is empty and that the server is a writable
+single-node replica-set primary before creating collections or indexes, and
+creates and verifies the declared model indexes. It disconnects after tests.
+The URI checks cannot prove a server is disposable: the operator must verify
+that independently. With authentication, use a dedicated `bizzrow_test` user
+with privileges restricted to the disposable test environment, not business
+credentials. Dispose of the entire test server after use; test databases are
+not dropped by the harness.
+
+For example, against an independently verified local disposable replica set:
+
+```powershell
+$env:FINANCIAL_TEST_MONGO_URI = "mongodb://127.0.0.1:27017/bizzrow_test?directConnection=true&replicaSet=bizzrowTestRs"
+node --test tests\*.test.js
+```
+
+Run the command from the `server` directory. Without the URI, MongoDB
+integration tests are skipped; a standalone MongoDB server is insufficient.
 
 ---
 

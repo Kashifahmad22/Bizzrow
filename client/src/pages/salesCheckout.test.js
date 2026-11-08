@@ -58,8 +58,9 @@ test("checkout submits a reviewed snapshot from the cart and rounds displayed un
   const fields = Object.fromEntries(mapper.body.properties.map((property) => [property.key.name, property.value]));
   assert.equal(fields.productId.object.name, mapper.params[0].name);
   assert.equal(fields.productId.property.name, "productId");
-  assert.equal(fields.quantity.object.name, mapper.params[0].name);
-  assert.equal(fields.quantity.property.name, "quantity");
+  assert.equal(fields.quantity.callee.name, "Number");
+  assert.equal(fields.quantity.arguments[0].object.name, mapper.params[0].name);
+  assert.equal(fields.quantity.arguments[0].property.name, "quantity");
   assert.equal(fields.unitPrice.callee.name, "round2");
   assert.equal(fields.unitPrice.arguments[0].object.name, mapper.params[0].name);
   assert.equal(fields.unitPrice.arguments[0].property.name, "unitPrice");

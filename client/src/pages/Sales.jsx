@@ -24,6 +24,9 @@ import { formatINR, formatDate, relativeTime } from "../lib/format.js";
 import { buildInvoicePrintHtml } from "../lib/invoicePrint.js";
 import { createLatestRequest } from "../lib/latestRequest.js";
 import { calculateCheckoutPayment } from "../lib/checkoutPayment.js";
+import { subtractQuantity, stepQuantity } from "../lib/quantity.js";
+import { multiplyRounded } from "../lib/money.js";
+import { estimateReturnRefund } from "../lib/returnMath.js";
 import PageHeader from "../components/PageHeader.jsx";
 import BusinessLogo from "../components/BusinessLogo.jsx";
 import Modal from "../components/Modal.jsx";
@@ -77,42 +80,6 @@ const DATE_PRESETS = [
 ];
 
 const round2 = (n) => Math.round((Number(n) || 0) * 100) / 100;
-
-function estimateReturnRefund(items, saleTotal, requestedItems) {
-  const weights = items.map((item) => item.subtotal != null
-    ? Number(item.subtotal) || 0
-    : (Number(item.unitPrice) || 0) * (Number(item.quantity) || 0));
-  const totalCents = Math.max(0, Math.round((Number(saleTotal) || 0) * 100));
-  const weightCents = weights.map((weight) => Math.max(0, Math.round(weight * 100)));
-  const weightTotal = weightCents.reduce((sum, value) => sum + value, 0);
-  const exact = weightCents.map((value) => weightTotal ? (totalCents * value) / weightTotal : 0);
-  const allocated = exact.map(Math.floor);
-  let remainder = totalCents - allocated.reduce((sum, value) => sum + value, 0);
-  const order = exact
-    .map((value, index) => ({ index, fraction: value - allocated[index] }))
-    .sort((a, b) => b.fraction - a.fraction || a.index - b.index);
-  for (let i = 0; i < remainder && order.length; i += 1) allocated[order[i].index] += 1;
-
-  const requestedByProduct = new Map();
-  for (const request of requestedItems) {
-    const id = String(request.productId);
-    requestedByProduct.set(id, (requestedByProduct.get(id) || 0) + Number(request.quantity || 0));
-  }
-  let refundCents = 0;
-  for (const [id, requested] of requestedByProduct) {
-    let remaining = requested;
-    for (const [index, item] of items.entries()) {
-      if (String(item.product) !== id || remaining <= 0) continue;
-      const oldReturned = Number(item.returnedQty) || 0;
-      const quantity = Math.min(Math.max(0, Number(item.quantity || 0) - oldReturned), remaining);
-      if (!quantity) continue;
-      refundCents += Math.round((allocated[index] * (oldReturned + quantity)) / item.quantity)
-        - Math.round((allocated[index] * oldReturned) / item.quantity);
-      remaining -= quantity;
-    }
-  }
-  return refundCents / 100;
-}
 
 // Timezone-safe day boundaries (Sprint 1.1 — Issue #1): compute the user's LOCAL
 // day start/end and send absolute ISO instants so the server filters consistently
@@ -471,15 +438,15 @@ function NewSaleModal({ onClose, onCreated }) {
     let gross = 0;
     let itemDisc = 0;
     for (const it of items) {
-      const g = round2(round2(it.unitPrice) * it.quantity);
+      const g = multiplyRounded(round2(it.unitPrice), Number(it.quantity) || 0);
       const dv = Number(it.discountValue) || 0;
-      const d = round2(Math.max(0, it.discountType === "percent" ? (g * Math.min(100, dv)) / 100 : Math.min(dv, g)));
+      const d = Math.max(0, it.discountType === "percent" ? multiplyRounded(g, Math.min(100, dv), 100) : Math.min(dv, g));
       gross = round2(gross + g);
       itemDisc = round2(itemDisc + d);
     }
     const subtotal = round2(Math.max(0, gross - itemDisc));
     const bv = Number(billDisc.value) || 0;
-    const billAmt = round2(Math.max(0, billDisc.type === "percent" ? (subtotal * Math.min(100, bv)) / 100 : Math.min(bv, subtotal)));
+    const billAmt = Math.max(0, billDisc.type === "percent" ? multiplyRounded(subtotal, Math.min(100, bv), 100) : Math.min(bv, subtotal));
     const total = round2(Math.max(0, subtotal - billAmt));
     return {
       grossSubtotal: round2(gross),
@@ -494,9 +461,9 @@ function NewSaleModal({ onClose, onCreated }) {
   const payment = calculateCheckoutPayment(total, pay);
 
   const lineNet = (it) => {
-    const g = round2(round2(it.unitPrice) * it.quantity);
+    const g = multiplyRounded(round2(it.unitPrice), Number(it.quantity) || 0);
     const dv = Number(it.discountValue) || 0;
-    const d = round2(Math.max(0, it.discountType === "percent" ? (g * Math.min(100, dv)) / 100 : Math.min(dv, g)));
+    const d = Math.max(0, it.discountType === "percent" ? multiplyRounded(g, Math.min(100, dv), 100) : Math.min(dv, g));
     return round2(Math.max(0, g - d));
   };
   const updateItem = (productId, patch) =>
@@ -526,7 +493,7 @@ function NewSaleModal({ onClose, onCreated }) {
           toast.error(`Only ${existing.max} in stock`);
           return prev;
         }
-        return prev.map((x) => (x.productId === p._id ? { ...x, quantity: x.quantity + 1 } : x));
+        return prev.map((x) => (x.productId === p._id ? { ...x, quantity: stepQuantity(x.quantity, x.max, 1) } : x));
       }
       const wholesalePrice = Number(p.wholesalePrice ?? p.sellingPrice) || 0;
       const retailPrice = Number(p.retailPrice ?? wholesalePrice * 2) || 0;
@@ -538,7 +505,7 @@ function NewSaleModal({ onClose, onCreated }) {
         wholesalePrice,
         retailPrice,
         unitPrice: saleType === "retail" ? retailPrice : wholesalePrice,
-        quantity: 1,
+        quantity: stepQuantity(0, p.stock, 1),
         max: p.stock,
         discountType: "amount",
         discountValue: 0,
@@ -547,7 +514,7 @@ function NewSaleModal({ onClose, onCreated }) {
   };
   const updateQty = (productId, qty) =>
     setItems((prev) => prev.map((it) => (it.productId === productId
-      ? { ...it, quantity: Math.max(1, Math.min(it.max, Math.trunc(Number(qty) || 1))) }
+      ? { ...it, quantity: qty }
       : it)));
   const removeItem = (productId) => setItems((prev) => prev.filter((it) => it.productId !== productId));
   const changeSaleType = (nextType) => {
@@ -569,6 +536,11 @@ function NewSaleModal({ onClose, onCreated }) {
 
   const submit = async () => {
     if (!step1Valid || items.length === 0) return;
+    if (items.some((item) => !/^\d+(?:\.\d{1,3})?$/.test(String(item.quantity))
+        || Number(item.quantity) <= 0 || Number(item.quantity) > item.max)) {
+      toast.error("Enter a quantity within stock, with at most three decimal places.");
+      return;
+    }
     if (payment.error) {
       toast.error(payment.error);
       return;
@@ -588,7 +560,7 @@ function NewSaleModal({ onClose, onCreated }) {
       saleType,
       items: items.map((it) => ({
         productId: it.productId,
-        quantity: it.quantity,
+        quantity: Number(it.quantity),
         unitPrice: it.unitPrice,
         discountType: it.discountType,
         discountValue: Number(it.discountValue) || 0,
@@ -597,7 +569,7 @@ function NewSaleModal({ onClose, onCreated }) {
       expectedTotal: total,
       reviewedItems: items.map((it) => ({
         productId: it.productId,
-        quantity: it.quantity,
+        quantity: Number(it.quantity),
         unitPrice: round2(it.unitPrice),
       })),
       payments,
@@ -852,7 +824,7 @@ function NewSaleModal({ onClose, onCreated }) {
                 ) : (
                   <div className="space-y-2 max-h-80 overflow-y-auto">
                     {items.map((it) => {
-                      const gross = round2(round2(it.unitPrice) * it.quantity);
+                      const gross = multiplyRounded(round2(it.unitPrice), Number(it.quantity) || 0);
                       const net = lineNet(it);
                       return (
                         <div key={it.productId} className="card !p-3">
@@ -862,9 +834,9 @@ function NewSaleModal({ onClose, onCreated }) {
                               <div className="text-xs text-ink-500">{formatINR(round2(it.unitPrice))} each</div>
                             </div>
                             <div className="flex items-center gap-1 bg-ink-50 rounded-lg px-1">
-                              <button onClick={() => updateQty(it.productId, it.quantity - 1)} className="w-7 h-7 text-ink-600 hover:text-brand-500">−</button>
-                              <input type="number" min="1" max={it.max} step="1" value={it.quantity} aria-label={`Quantity for ${it.name}`} onChange={(e) => updateQty(it.productId, e.target.value)} className="input !py-1 !px-1 w-20 text-center font-bold text-sm" />
-                              <button onClick={() => updateQty(it.productId, it.quantity + 1)} className="w-7 h-7 text-ink-600 hover:text-brand-500">+</button>
+                              <button onClick={() => updateQty(it.productId, stepQuantity(it.quantity, it.max, -1))} className="w-7 h-7 text-ink-600 hover:text-brand-500">−</button>
+                              <input type="number" min="0.001" max={it.max} step="0.001" value={it.quantity} aria-label={`Quantity for ${it.name}`} onChange={(e) => updateQty(it.productId, e.target.value)} className="input !py-1 !px-1 w-20 text-center font-bold text-sm" />
+                              <button onClick={() => updateQty(it.productId, stepQuantity(it.quantity, it.max, 1))} className="w-7 h-7 text-ink-600 hover:text-brand-500">+</button>
                             </div>
                             <div className="text-right min-w-20 shrink-0">
                               <div className="text-sm font-bold text-ink-800">{formatINR(net)}</div>
@@ -1035,7 +1007,7 @@ function InvoiceModal({ invoice, onClose, onChanged }) {
   const [returnOpen, setReturnOpen] = useState(false);
   const [replaceOpen, setReplaceOpen] = useState(false);
   const [history, setHistory] = useState([]);
-  const returnable = (invoice.items || []).some((it) => (it.quantity || 0) - (it.returnedQty || 0) > 0);
+  const returnable = (invoice.items || []).some((it) => subtractQuantity(it.quantity || 0, it.returnedQty || 0) > 0);
   const hasBankDetails = Object.values(invoice.business?.bankDetails || {})
     .some((value) => typeof value === "string" && value.trim());
   const printInvoice = () => {
@@ -1322,7 +1294,7 @@ function ReplacementModal({ saleId, items, saleTotal, saleType = "wholesale", on
   };
 
   const returnRows = (items || [])
-    .map((it) => ({ ...it, returnable: (it.quantity || 0) - (it.returnedQty || 0) }))
+    .map((it) => ({ ...it, returnable: subtractQuantity(it.quantity || 0, it.returnedQty || 0) }))
     .filter((it) => it.returnable > 0);
 
   useEffect(() => {
@@ -1368,27 +1340,32 @@ function ReplacementModal({ saleId, items, saleTotal, saleType = "wholesale", on
     saleTotal,
     returnRows.map((it) => ({ productId: it.product, quantity: Number(retQtys[it.product]) || 0 }))
   );
-  const replacement = cart.reduce((a, c) => a + c.unitPrice * c.quantity, 0);
+  const replacement = round2(cart.reduce((a, c) => a + multiplyRounded(c.unitPrice, Number(c.quantity) || 0), 0));
   const diff = round2(replacement - refund);
 
   const addCart = (p) =>
     setCart((prev) => {
       const ex = prev.find((x) => x.productId === p._id);
-      if (ex) return prev.map((x) => (x.productId === p._id ? { ...x, quantity: Math.min(x.max, x.quantity + 1) } : x));
+      if (ex) return prev.map((x) => (x.productId === p._id ? { ...x, quantity: stepQuantity(x.quantity, x.max, 1) } : x));
       const wholesalePrice = Number(p.wholesalePrice ?? p.sellingPrice) || 0;
       const retailPrice = Number(p.retailPrice ?? wholesalePrice * 2) || 0;
       return [...prev, {
         productId: p._id,
         name: p.name,
         unitPrice: saleType === "retail" ? retailPrice : wholesalePrice,
-        quantity: 1,
+        quantity: stepQuantity(0, p.stock, 1),
         max: p.stock,
       }];
     });
 
   const submit = async () => {
     const returnItems = returnRows.map((it) => ({ productId: it.product, quantity: Number(retQtys[it.product]) || 0 })).filter((x) => x.quantity > 0);
-    const newItems = cart.map((c) => ({ productId: c.productId, quantity: c.quantity, unitPrice: c.unitPrice }));
+    if (cart.some((item) => !/^\d+(?:\.\d{1,3})?$/.test(String(item.quantity))
+        || Number(item.quantity) <= 0 || Number(item.quantity) > item.max)) {
+      toast.error("Enter a replacement quantity within stock, with at most three decimal places.");
+      return;
+    }
+    const newItems = cart.map((c) => ({ productId: c.productId, quantity: Number(c.quantity), unitPrice: c.unitPrice }));
     if (returnItems.length === 0 || newItems.length === 0) {
       toast.error("Pick items to return and replacement items");
       return;
@@ -1441,7 +1418,7 @@ function ReplacementModal({ saleId, items, saleTotal, saleType = "wholesale", on
                   <div className="text-sm font-semibold text-ink-800 truncate">{it.name}</div>
                   <div className="text-[11px] text-ink-500">{it.returnable} returnable</div>
                 </div>
-                <input type="number" min="0" max={it.returnable} value={retQtys[it.product] || ""} onChange={(e) => setRetQtys({ ...retQtys, [it.product]: Math.max(0, Math.min(it.returnable, Number(e.target.value) || 0)) })} className="input !py-1.5 !w-16 text-sm text-right" placeholder="0" />
+                <input type="number" min="0" max={it.returnable} step="any" value={retQtys[it.product] || ""} onChange={(e) => setRetQtys({ ...retQtys, [it.product]: e.target.value })} className="input !py-1.5 !w-16 text-sm text-right" placeholder="0" />
               </div>
             ))}
           </div>
@@ -1478,8 +1455,8 @@ function ReplacementModal({ saleId, items, saleTotal, saleType = "wholesale", on
           {cart.map((c) => (
             <div key={c.productId} className="flex items-center gap-2 text-sm py-1">
               <span className="flex-1 truncate text-ink-800">{c.name}</span>
-              <input type="number" min="1" max={c.max} step="1" value={c.quantity} aria-label={`Quantity for ${c.name}`} onChange={(e) => setCart((prev) => prev.map((item) => item.productId === c.productId ? { ...item, quantity: Math.max(1, Math.min(item.max, Math.trunc(Number(e.target.value) || 1))) } : item))} className="input !py-1 !px-1 w-20 text-center" />
-              <span className="font-semibold text-ink-800 w-16 text-right">{formatINR(c.unitPrice * c.quantity)}</span>
+              <input type="number" min="0.001" max={c.max} step="0.001" value={c.quantity} aria-label={`Quantity for ${c.name}`} onChange={(e) => setCart((prev) => prev.map((item) => item.productId === c.productId ? { ...item, quantity: e.target.value } : item))} className="input !py-1 !px-1 w-20 text-center" />
+              <span className="font-semibold text-ink-800 w-16 text-right">{formatINR(multiplyRounded(c.unitPrice, Number(c.quantity) || 0))}</span>
               <button onClick={() => setCart((prev) => prev.filter((x) => x.productId !== c.productId))} className="text-rose-500"><Trash2 className="w-3.5 h-3.5" /></button>
             </div>
           ))}
@@ -1506,7 +1483,7 @@ function ReturnModal({ saleId, items, saleTotal, onClose, onDone }) {
   const [reason, setReason] = useState("Defective");
   const [notes, setNotes] = useState("");
   const rows = (items || [])
-    .map((it) => ({ ...it, returnable: (it.quantity || 0) - (it.returnedQty || 0) }))
+    .map((it) => ({ ...it, returnable: subtractQuantity(it.quantity || 0, it.returnedQty || 0) }))
     .filter((it) => it.returnable > 0);
   const totalSelected = rows.reduce((a, it) => a + (Number(qtys[it.product]) || 0), 0);
   const estimatedRefund = estimateReturnRefund(
@@ -1585,8 +1562,9 @@ function ReturnModal({ saleId, items, saleTotal, onClose, onDone }) {
               type="number"
               min="0"
               max={it.returnable}
+              step="any"
               value={qtys[it.product] || ""}
-              onChange={(e) => setQtys({ ...qtys, [it.product]: Math.max(0, Math.min(it.returnable, Number(e.target.value) || 0)) })}
+              onChange={(e) => setQtys({ ...qtys, [it.product]: e.target.value })}
               className="input !py-1.5 !w-20 text-sm text-right"
               placeholder="0"
             />

@@ -11,21 +11,19 @@ const Sale = require("../models/Sale");
 const ReturnRecord = require("../models/ReturnRecord");
 const LedgerEntry = require("../models/LedgerEntry");
 const Counter = require("../models/Counter");
-const { idempotencyIdentity } = require("../services/financialTransaction");
+const { idempotencyIdentity, requestFingerprint } = require("../services/financialTransaction");
 const { errorHandler } = require("../middleware/error");
+const StockBatch = require("../models/StockBatch");
+const StockAdjustment = require("../models/StockAdjustment");
+const { connectIsolatedMongo } = require("./helpers/isolatedMongo");
 
 const uri = process.env.FINANCIAL_TEST_MONGO_URI;
 
 test("customer split payments and replacement tender use valid ledger methods", {
   skip: uri ? false : "Set FINANCIAL_TEST_MONGO_URI to an isolated test replica-set database",
-}, async () => {
-  const parsed = new URL(uri);
-  const db = decodeURIComponent(parsed.pathname.replace(/^\/+/, ""));
-  if (!["localhost", "127.0.0.1", "[::1]"].includes(parsed.hostname.toLowerCase())
-      || !/(^test|[-_]test|testing)/i.test(db)) {
-    throw new Error("Route integration tests require a loopback test database");
-  }
-  await mongoose.connect(uri, { autoIndex: false });
+}, async (t) => {
+  t.after(() => mongoose.disconnect());
+  await connectIsolatedMongo(uri, [User, Product, StockBatch, StockAdjustment, Customer, Sale, ReturnRecord, LedgerEntry, Counter]);
   const ownerId = new mongoose.Types.ObjectId();
   const previousSecret = process.env.JWT_SECRET;
   process.env.JWT_SECRET = crypto.randomUUID();
@@ -34,6 +32,7 @@ test("customer split payments and replacement tender use valid ledger methods", 
   app.use("/sales", require("../routes/sales"));
   app.use("/ledger", require("../routes/ledger"));
   app.use("/dashboard", require("../routes/dashboard"));
+  app.use("/products", require("../routes/products"));
   app.use(errorHandler);
   const server = await new Promise((resolve) => {
     const listener = app.listen(0, "127.0.0.1", () => resolve(listener));
@@ -82,11 +81,15 @@ test("customer split payments and replacement tender use valid ledger methods", 
 
     const replacementKey = crypto.randomUUID();
     keys.push(idempotencyIdentity(ownerId, `sale-replace:${first.sale._id}`, replacementKey));
-    const result = await request(`/sales/${first.sale._id}/replace`, {
+    const replacementBody = {
       returnItems: [{ productId: String(product._id), quantity: 1 }],
       newItems: [{ productId: String(replacement._id), quantity: 1 }],
       payments: [{ method: "upi", amount: 50 }],
-    }, replacementKey);
+    };
+    const result = await request(`/sales/${first.sale._id}/replace`, replacementBody, replacementKey);
+    const replacementReplay = await request(`/sales/${first.sale._id.toUpperCase()}/replace`, replacementBody, replacementKey);
+    assert.equal(result.newSale._id, replacementReplay.newSale._id);
+    assert.equal(await ReturnRecord.countDocuments({ owner: ownerId, sale: first.sale._id, type: "replacement" }), 1);
     assert.equal(result.newSale.creditApplied, 100);
     assert.equal(result.newSale.amountPaid, 50);
     assert.equal(result.newSale.dueAmount, 0);
@@ -131,9 +134,112 @@ test("customer split payments and replacement tender use valid ledger methods", 
     assert.equal(historicalSummary.historicalIncomplete, true);
     assert.equal(historicalSummary.today.total, 182);
     assert.equal((await request("/dashboard/analytics?metric=collection")).historicalIncomplete, true);
+
+    const isolatedCustomer = await Customer.create({
+      _id: "abcdefabcdefabcdefabcdef", owner: ownerId, name: "Retry customer", phone: `retry-${ownerId}`,
+    });
+    const retrySaleKey = crypto.randomUUID();
+    keys.push(idempotencyIdentity(ownerId, "sale-create", retrySaleKey));
+    const retrySale = await request("/sales", {
+      customerType: "existing", customerId: String(isolatedCustomer._id), saleType: "retail",
+      items: [{ productId: String(product._id), quantity: 2 }], payments: [],
+    }, retrySaleKey);
+    const customerId = String(isolatedCustomer._id);
+    const paymentKey2 = crypto.randomUUID();
+    keys.push(idempotencyIdentity(ownerId, `ledger-payment:${customerId}`, paymentKey2));
+    const paymentBody = { amount: 10, paymentMethod: "cash" };
+    const [paymentA, paymentB] = await Promise.all([
+      request(`/ledger/${customerId}/payment`, paymentBody, paymentKey2),
+      request(`/ledger/${customerId.toUpperCase()}/payment`, paymentBody, paymentKey2),
+    ]);
+    assert.equal(paymentA.entry._id, paymentB.entry._id);
+    assert.equal((await request(`/ledger/${customerId}/payment`, paymentBody, paymentKey2)).entry._id, paymentA.entry._id);
+    assert.equal(await LedgerEntry.countDocuments({ owner: ownerId, customer: customerId, type: "payment" }), 1);
+    assert.equal((await Customer.findById(customerId)).pendingBalance, 190);
+    assert.equal((await Sale.findById(retrySale.sale._id)).dueAmount, 190);
+    const changed = await fetch(`http://127.0.0.1:${server.address().port}/ledger/${customerId.toUpperCase()}/payment`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json", "Idempotency-Key": paymentKey2 },
+      body: JSON.stringify({ ...paymentBody, amount: 11 }),
+    });
+    assert.equal(changed.status, 409);
+
+    const retrySaleId = retrySale.sale._id;
+    const returnKey2 = crypto.randomUUID();
+    keys.push(idempotencyIdentity(ownerId, `sale-return:${retrySaleId}`, returnKey2));
+    const returnBody = { items: [{ productId: String(product._id), quantity: 1 }] };
+    const [returnA, returnB] = await Promise.all([
+      request(`/sales/${retrySaleId}/return`, returnBody, returnKey2),
+      request(`/sales/${retrySaleId.toUpperCase()}/return`, returnBody, returnKey2),
+    ]);
+    assert.equal(returnA.record._id, returnB.record._id);
+    assert.equal((await request(`/sales/${retrySaleId}/return`, returnBody, returnKey2)).record._id, returnA.record._id);
+    assert.equal(await ReturnRecord.countDocuments({ owner: ownerId, sale: retrySaleId }), 1);
+    assert.equal((await Sale.findById(retrySaleId)).items[0].returnedQty, 1);
+    assert.equal((await Product.findById(product._id)).stock, 3);
+    assert.equal((await Customer.findById(customerId)).pendingBalance, 90);
+
+    const legacyId = "AbCdEfAbCdEfAbCdEfAbCdEf";
+    const legacyKey = crypto.randomUUID();
+    const legacyCounterId = idempotencyIdentity(ownerId, `ledger-payment:${legacyId}`, legacyKey);
+    const canonicalCounterId = idempotencyIdentity(ownerId, `ledger-payment:${customerId}`, legacyKey);
+    keys.push(legacyCounterId, canonicalCounterId);
+    await Counter.create({
+      _id: legacyCounterId, seq: 0,
+      requestHash: requestFingerprint("ledger:payment", { customerId: legacyId }, paymentBody),
+      resultType: "ledger-payment", resultId: paymentA.entry._id, relatedResourceId: customerId,
+    });
+    assert.equal((await request(`/ledger/${customerId.toUpperCase()}/payment`, paymentBody, legacyKey)).entry._id, paymentA.entry._id);
+    assert.equal((await Customer.findById(customerId)).pendingBalance, 90);
+    const changedLegacy = await fetch(`http://127.0.0.1:${server.address().port}/ledger/${customerId}/payment`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json", "Idempotency-Key": legacyKey },
+      body: JSON.stringify({ ...paymentBody, amount: 11 }),
+    });
+    assert.equal(changedLegacy.status, 409);
+    await Counter.create({
+      _id: canonicalCounterId, seq: 0,
+      requestHash: requestFingerprint("ledger:payment", { customerId }, paymentBody),
+      resultType: "ledger-payment", resultId: paymentA.entry._id, relatedResourceId: customerId,
+    });
+    const ambiguous = await fetch(`http://127.0.0.1:${server.address().port}/ledger/${customerId}/payment`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json", "Idempotency-Key": legacyKey },
+      body: JSON.stringify(paymentBody),
+    });
+    assert.equal(ambiguous.status, 409);
+    assert.equal((await Customer.findById(customerId)).pendingBalance, 90);
+    const invalid = await fetch(`http://127.0.0.1:${server.address().port}/ledger/invalid/payment`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json", "Idempotency-Key": crypto.randomUUID() },
+      body: JSON.stringify(paymentBody),
+    });
+    assert.equal(invalid.status, 400);
+
+    const inventoryProduct = await Product.create({
+      _id: "fedcbafedcbafedcbafedcba", owner: ownerId, name: "Retry inventory", sellingPrice: 10, stock: 0,
+    });
+    const inventoryId = String(inventoryProduct._id);
+    const batchKey = crypto.randomUUID();
+    keys.push(idempotencyIdentity(ownerId, `stock-batch:${inventoryId}`, batchKey));
+    const batchBody = { quantityReceived: 3, batchCode: "retry-batch" };
+    const batch = await request(`/products/${inventoryId}/batches`, batchBody, batchKey);
+    const batchReplay = await request(`/products/${inventoryId.toUpperCase()}/batches`, batchBody, batchKey);
+    assert.equal(batch.batch._id, batchReplay.batch._id);
+    assert.equal(await StockBatch.countDocuments({ owner: ownerId, product: inventoryId }), 1);
+    const adjustmentKey = crypto.randomUUID();
+    keys.push(idempotencyIdentity(ownerId, `stock-adjustment:${inventoryId}`, adjustmentKey));
+    const adjustmentBody = { delta: 1, reason: "count" };
+    const adjustment = await request(`/products/${inventoryId}/stock-adjustments`, adjustmentBody, adjustmentKey);
+    const adjustmentReplay = await request(`/products/${inventoryId.toUpperCase()}/stock-adjustments`, adjustmentBody, adjustmentKey);
+    assert.equal(adjustment.adjustment._id, adjustmentReplay.adjustment._id);
+    assert.equal(await StockAdjustment.countDocuments({ owner: ownerId, product: inventoryId }), 1);
+    assert.equal((await Product.findById(inventoryId)).stock, 4);
   } finally {
     await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
     await ReturnRecord.deleteMany({ owner: ownerId });
+    await StockAdjustment.deleteMany({ owner: ownerId });
+    await StockBatch.deleteMany({ owner: ownerId });
     await LedgerEntry.deleteMany({ owner: ownerId });
     await Sale.deleteMany({ owner: ownerId });
     await Product.deleteMany({ owner: ownerId });

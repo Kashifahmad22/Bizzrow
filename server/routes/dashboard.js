@@ -27,7 +27,7 @@ function roundCurrency(value) {
 function saleCollectionPaymentsExpression() {
   return {
     $cond: [
-      { $ne: [{ $type: "$collectionPayments" }, "missing"] },
+      { $ne: [{ $ifNull: ["$collectionPayments", null] }, null] },
       { $ifNull: ["$collectionPayments", []] },
       {
         $cond: [
@@ -161,7 +161,7 @@ router.get(
       Sale.find({ owner: ownerId }).sort({ createdAt: -1 }).limit(6).select("customerName total paymentStatus invoiceNumber createdAt items"),
       Customer.find({ owner: ownerId }).sort({ updatedAt: -1 }).limit(6).select("name shopName phone pendingBalance lastPurchaseAt"),
       Sale.find({ owner: ownerId, createdAt: { $gte: startOfMonth } }).select("items total returnedAmount"),
-      Sale.exists({ owner: ownerId, collectionPayments: { $exists: false } }),
+      Sale.exists({ owner: ownerId, collectionPayments: null }),
     ]);
 
     const monthly = salesAgg[0] || { totalRevenue: 0, totalDue: 0, count: 0 };
@@ -335,7 +335,7 @@ router.get(
 
     if (metric === "collection") {
       const trendStart = new Date(now.getTime() - 13 * 86400000);
-      const [rangeSales, trendRows, ledgerPayments, cashRefunds, ledgerTrendRows, cashRefundTrendRows, historicalCollectionsIncomplete] = await Promise.all([
+      const [rangeSales, trendRows, ledgerPayments, cashRefunds, ledgerTrendRows, cashRefundTrendRows, historicalCollectionsIncomplete, rangeSaleTotals, rangeLedgerTotals, rangeRefundTotals] = await Promise.all([
         Sale.find({ owner: ownerId, createdAt: { $gte: from, $lte: to } })
           .select("customerName invoiceNumber collectionPayments payments amountPaid paymentMethod createdAt")
           .sort({ createdAt: -1 })
@@ -367,7 +367,13 @@ router.get(
           { $gte: trendStart },
           { trend: true }
         )),
-        Sale.exists({ owner: ownerId, collectionPayments: { $exists: false } }),
+        Sale.exists({ owner: ownerId, collectionPayments: null }),
+        Sale.aggregate(saleCollectionsByMethod(ownerId, { $gte: from, $lte: to })),
+        LedgerEntry.aggregate([
+          { $match: ledgerCollectionFilter(ownerId, { $gte: from, $lte: to }) },
+          { $group: { _id: null, amount: { $sum: { $multiply: ["$amount", -1] } } } },
+        ]),
+        ReturnRecord.aggregate(refundCollectionPipeline(ownerId, { $gte: from, $lte: to })),
       ]);
       const records = [];
       for (const s of rangeSales) {
@@ -430,7 +436,9 @@ router.get(
         const refunded = cashRefundTrendRows.find((x) => x._id === key)?.amount || 0;
         trend.push({ date: key, collected: roundCurrency((f?.collected || 0) + ledgerCollected - refunded) });
       }
-      return res.json({ metric, total: roundCurrency(records.reduce((sum, record) => sum + record.amount, 0)), records, trend, historicalIncomplete: Boolean(historicalCollectionsIncomplete) });
+      const total = methodAggToObject(rangeSaleTotals).total
+        + (rangeLedgerTotals[0]?.amount || 0) - methodAggToObject(rangeRefundTotals).total;
+      return res.json({ metric, total: roundCurrency(total), records, trend, historicalIncomplete: Boolean(historicalCollectionsIncomplete) });
     }
 
     if (metric === "outstanding") {
