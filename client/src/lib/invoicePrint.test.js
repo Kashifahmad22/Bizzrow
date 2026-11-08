@@ -57,6 +57,16 @@ test("thermal browser layouts use dedicated narrow widths", () => {
   assert.match(buildInvoicePrintHtml(invoice, "thermal58"), /size: 58mm auto/);
 });
 
+test("invoice formats show only recorded original cash tender and change", () => {
+  for (const format of ["a4", "thermal80", "thermal58"]) {
+    const html = buildInvoicePrintHtml({ ...invoice, cashTendered: 100, cashChange: 50 }, format);
+    assert.match(html, /Original cash tendered/);
+    assert.match(html, /Original change returned/);
+    assert.match(html, /Rs\. 100\.00/);
+    assert.doesNotMatch(buildInvoicePrintHtml(invoice, format), /Original cash tendered|Original change returned/);
+  }
+});
+
 test("A4 and thermal print invoices show optional bank details and existing tax entries only", () => {
   for (const format of ["a4", "thermal80", "thermal58"]) {
     const html = buildInvoicePrintHtml({

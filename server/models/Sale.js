@@ -75,9 +75,11 @@ const saleSchema = new mongoose.Schema(
       sale: { type: mongoose.Schema.Types.ObjectId, ref: "Sale", required: true },
       amount: { type: Number, required: true, min: 0 },
     }],
-    // Payment splits record actual tender; credit is tracked separately.
+    // Payment splits record collected amounts; credit is tracked separately.
     payments: { type: [paymentSplitSchema], default: [] },
     collectionPayments: { type: [paymentSplitSchema], default: undefined, immutable: true },
+    cashTendered: { type: Number, min: 0, default: undefined, immutable: true },
+    cashChange: { type: Number, min: 0, default: undefined, immutable: true },
     amountPaid: { type: Number, default: 0, min: 0 },
     dueAmount: { type: Number, default: 0, min: 0 },
     // Summary method: a single method, or "split" when more than one was used.

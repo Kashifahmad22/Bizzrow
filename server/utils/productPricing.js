@@ -21,6 +21,12 @@ function salePrice(product, saleType = "wholesale") {
   return saleType === "retail" ? retailPrice(product) : wholesalePrice(product);
 }
 
+function initialSalePrice(product, saleType, item, body) {
+  const authoritative = body.saleType || ["expectedTotal", "reviewedItems", "cashTendered"]
+    .some((field) => Object.prototype.hasOwnProperty.call(body, field));
+  return authoritative ? salePrice(product, saleType) : Number(item.unitPrice ?? wholesalePrice(product));
+}
+
 function serializeProduct(product) {
   const result = typeof product.toObject === "function" ? product.toObject() : { ...product };
   result.wholesalePrice = wholesalePrice(result);
@@ -52,4 +58,4 @@ function normalizeProductPrices(body, { creating = false } = {}) {
   return values;
 }
 
-module.exports = { wholesalePrice, retailPrice, salePrice, serializeProduct, normalizeProductPrices };
+module.exports = { wholesalePrice, retailPrice, salePrice, initialSalePrice, serializeProduct, normalizeProductPrices };

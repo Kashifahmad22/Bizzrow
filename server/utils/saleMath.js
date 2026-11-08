@@ -116,6 +116,116 @@ function normalizePaymentSplits(payments, maximum) {
   return normalized;
 }
 
+function paymentPaise(value) {
+  if ((typeof value !== "string" && typeof value !== "number")
+      || !/^\d+(?:\.\d{1,2})?$/.test(String(value))) {
+    throw new Error("Payment amounts must be non-negative with at most two decimal places");
+  }
+  const [whole, fraction = ""] = String(value).split(".");
+  const paise = Number(whole) * 100 + Number(fraction.padEnd(2, "0"));
+  if (!Number.isSafeInteger(paise)) throw new Error("Payment amount is too large");
+  return paise;
+}
+
+function validateExpectedTotal(body, total) {
+  if (!Object.prototype.hasOwnProperty.call(body, "expectedTotal")) return;
+  let expected;
+  try {
+    expected = paymentPaise(body.expectedTotal);
+  } catch (error) {
+    error.status = 400;
+    throw error;
+  }
+  if (expected !== paymentPaise(total)) {
+    const error = new Error("Prices or invoice totals changed. Discard the pending sale, close and reopen checkout to refresh prices, and review the invoice before retrying.");
+    error.status = 409;
+    throw error;
+  }
+}
+
+function validateReviewedItems(body, items, { checkPrices = true } = {}) {
+  if (!Object.prototype.hasOwnProperty.call(body, "reviewedItems")) return;
+  const conflict = () => {
+    const error = new Error("Cart items or prices changed. Discard the pending sale, close and reopen checkout to refresh prices, and review the updated cart before retrying.");
+    error.status = 409;
+    return error;
+  };
+  if (!Array.isArray(body.reviewedItems) || body.reviewedItems.length !== items.length) throw conflict();
+  const expected = new Map();
+  for (const line of body.reviewedItems) {
+    if (!line || typeof line.productId !== "string" || !/^[0-9a-f]{24}$/i.test(line.productId)
+        || typeof line.quantity !== "number" || !Number.isFinite(line.quantity) || line.quantity <= 0) {
+      throw conflict();
+    }
+    const id = line.productId.toLowerCase();
+    if (expected.has(id)) throw conflict();
+    let price;
+    try {
+      price = paymentPaise(line.unitPrice);
+    } catch (error) {
+      throw conflict();
+    }
+    expected.set(id, { quantity: line.quantity, price });
+  }
+  for (const item of items) {
+    const id = String(item.product).toLowerCase();
+    const line = expected.get(id);
+    if (!line || line.quantity !== item.quantity
+        || (checkPrices && line.price !== paymentPaise(item.unitPrice))) throw conflict();
+    expected.delete(id);
+  }
+  if (expected.size) throw conflict();
+}
+
+function normalizeCheckoutPayments(body, maximum) {
+  const hasTender = Object.prototype.hasOwnProperty.call(body, "cashTendered");
+  if (Object.prototype.hasOwnProperty.call(body, "cashChange")) {
+    throw new Error("Change is calculated by the server");
+  }
+  if (hasTender && (Object.prototype.hasOwnProperty.call(body, "amountPaid")
+      || Object.prototype.hasOwnProperty.call(body, "paymentMethod"))) {
+    throw new Error("Cash tender cannot be combined with legacy payment fields");
+  }
+  if ((hasTender && Object.prototype.hasOwnProperty.call(body, "payments") && !Array.isArray(body.payments))
+      || (body.payments != null && !Array.isArray(body.payments))) {
+    throw new Error("Payments must be an array");
+  }
+  const requested = body.payments != null
+    ? body.payments
+    : body.amountPaid != null && Number(body.amountPaid) !== 0
+      ? [{ method: body.paymentMethod || "cash", amount: body.amountPaid }]
+      : [];
+  if (body.amountPaid != null) paymentPaise(body.amountPaid);
+  for (const payment of requested) {
+    if (!payment || !["cash", "upi", "bank", "card"].includes(payment.method)) {
+      throw new Error("Payment method must be cash, upi, bank, or card");
+    }
+    if (paymentPaise(payment.amount) <= 0) throw new Error("Each payment amount must be positive");
+    if (hasTender && payment.method === "cash") {
+      throw new Error("Cash splits cannot be combined with cash tender");
+    }
+  }
+  const totalPaise = paymentPaise(maximum);
+  let paidPaise = 0;
+  for (const payment of requested) {
+    paidPaise += paymentPaise(payment.amount);
+    if (!Number.isSafeInteger(paidPaise)) throw new Error("Payment amount is too large");
+  }
+  if (paidPaise > totalPaise) throw new Error("Payments cannot exceed the amount due");
+  const payments = requested.map(({ method, amount }) => ({ method, amount: paymentPaise(amount) / 100 }));
+  let snapshot = {};
+  if (hasTender) {
+    const tenderPaise = paymentPaise(body.cashTendered);
+    if (totalPaise === 0 && tenderPaise > 0) throw new Error("Cash tender is not allowed for a zero-value sale");
+    const cashPaise = Math.min(tenderPaise, totalPaise - paidPaise);
+    if (cashPaise > 0) payments.unshift({ method: "cash", amount: cashPaise / 100 });
+    paidPaise += cashPaise;
+    snapshot = { cashTendered: tenderPaise / 100, cashChange: (tenderPaise - cashPaise) / 100 };
+  }
+  const summaryMethod = payments.length > 1 ? "split" : payments.length ? payments[0].method : "cash";
+  return { payments, amountPaid: paidPaise / 100, dueAmount: (totalPaise - paidPaise) / 100, summaryMethod, ...snapshot };
+}
+
 /**
  * computeSaleTotals({ items, billDiscount })
  *  items: [{ unitPrice, quantity, discountType?, discountValue? , ...snapshot }]
@@ -296,6 +406,9 @@ module.exports = {
   allocateCents,
   allocateReturnItems,
   normalizePaymentSplits,
+  normalizeCheckoutPayments,
+  validateExpectedTotal,
+  validateReviewedItems,
   computeReturnSettlement,
   computeReplacementCredit,
   round2,

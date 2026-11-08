@@ -88,6 +88,10 @@ function invoiceRows(sale) {
     const label = PAYMENT_LABELS[payment.method] || printable(payment.method, "Payment");
     rows.push([`${label}${payment.source === "ledger" ? " (later ledger payment)" : ""}`, currency(payment.amount), "payment"]);
   }
+  if (sale.cashTendered != null && sale.cashChange != null) {
+    rows.push(["Original cash tendered", currency(sale.cashTendered)]);
+    rows.push(["Original change returned", currency(sale.cashChange)]);
+  }
   if (number(sale.creditApplied) > 0) rows.push(["Replacement credit applied", currency(sale.creditApplied), "credit"]);
   rows.push(["Amount paid", currency(sale.amountPaid)]);
   rows.push(["Outstanding balance", currency(sale.dueAmount), number(sale.dueAmount) > 0 ? "due" : ""]);

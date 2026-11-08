@@ -179,12 +179,25 @@ test("80mm and 58mm invoices use narrow receipt page widths", async () => {
   }
 });
 
+test("invoice formats show recorded original tender and change without inventing legacy values", async () => {
+  const sale = fixture({ cashTendered: 120, cashChange: 20 });
+  assert.ok(invoiceRows(sale).some((row) => row[0] === "Original cash tendered" && row[1] === "Rs. 120.00"));
+  assert.ok(invoiceRows(sale).some((row) => row[0] === "Original change returned" && row[1] === "Rs. 20.00"));
+  assert.equal(invoiceRows(fixture()).some((row) => row[0].startsWith("Original cash")), false);
+  for (const format of ["a4", "thermal80", "thermal58"]) {
+    const pdf = await buildInvoicePdfDocument(sale, { name: "Test Shop" }, {}, { format });
+    assert.equal(pageCount(pdf), 1);
+  }
+});
+
 test("thermal rows reserve space for wrapped labels and amounts", async () => {
   const sale = fixture({
     items: [{ ...fixture().items[0], quantity: 123456789, unitPrice: 123456789, subtotal: 123456789012345 }],
     subtotal: 123456789012345,
     total: 123456789012345,
     amountPaid: 123456789012345,
+    cashTendered: 123456789012345,
+    cashChange: 0,
     payments: [{ method: "cash", amount: 123456789012345, source: "ledger" }],
   });
   const originalText = PDFDocument.prototype.text;

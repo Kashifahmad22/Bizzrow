@@ -63,7 +63,7 @@ function requireIdempotencyKey(req) {
   return key;
 }
 
-async function executeIdempotently({ ownerId, operation, key, fingerprint, work, replay }) {
+async function executeIdempotently({ ownerId, operation, key, fingerprint, prepare, work, replay }) {
   const identity = idempotencyIdentity(ownerId, operation, key);
   let outcome;
   try {
@@ -76,12 +76,13 @@ async function executeIdempotently({ ownerId, operation, key, fingerprint, work,
         return { replayed: true, record: existing };
       }
 
+      const prepared = prepare ? await prepare(session) : undefined;
       const [record] = await Counter.create([{
         _id: identity,
         seq: 0,
         requestHash: fingerprint,
       }], { session });
-      const result = await work(session);
+      const result = await work(session, prepared);
       record.resultType = result.resultType;
       record.resultId = result.resultId;
       record.relatedResourceId = result.relatedResourceId || null;

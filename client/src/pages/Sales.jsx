@@ -23,6 +23,7 @@ import { api } from "../api/client.js";
 import { formatINR, formatDate, relativeTime } from "../lib/format.js";
 import { buildInvoicePrintHtml } from "../lib/invoicePrint.js";
 import { createLatestRequest } from "../lib/latestRequest.js";
+import { calculateCheckoutPayment } from "../lib/checkoutPayment.js";
 import PageHeader from "../components/PageHeader.jsx";
 import BusinessLogo from "../components/BusinessLogo.jsx";
 import Modal from "../components/Modal.jsx";
@@ -402,7 +403,7 @@ function NewSaleModal({ onClose, onCreated }) {
   const [walkInName, setWalkInName] = useState("");
 
   const [items, setItems] = useState([]);
-  const [pay, setPay] = useState({ cash: "", upi: "", bank: "" });
+  const [pay, setPay] = useState({ cash: "", upi: "", bank: "", card: "" });
   const [q, setQ] = useState("");
   const [pq, setPq] = useState("");
 
@@ -470,16 +471,16 @@ function NewSaleModal({ onClose, onCreated }) {
     let gross = 0;
     let itemDisc = 0;
     for (const it of items) {
-      const g = it.unitPrice * it.quantity;
+      const g = round2(round2(it.unitPrice) * it.quantity);
       const dv = Number(it.discountValue) || 0;
-      const d = it.discountType === "percent" ? (g * Math.min(100, dv)) / 100 : Math.min(dv, g);
-      gross += g;
-      itemDisc += d;
+      const d = round2(Math.max(0, it.discountType === "percent" ? (g * Math.min(100, dv)) / 100 : Math.min(dv, g)));
+      gross = round2(gross + g);
+      itemDisc = round2(itemDisc + d);
     }
-    const subtotal = Math.max(0, gross - itemDisc);
+    const subtotal = round2(Math.max(0, gross - itemDisc));
     const bv = Number(billDisc.value) || 0;
-    const billAmt = billDisc.type === "percent" ? (subtotal * Math.min(100, bv)) / 100 : Math.min(bv, subtotal);
-    const total = Math.max(0, subtotal - billAmt);
+    const billAmt = round2(Math.max(0, billDisc.type === "percent" ? (subtotal * Math.min(100, bv)) / 100 : Math.min(bv, subtotal)));
+    const total = round2(Math.max(0, subtotal - billAmt));
     return {
       grossSubtotal: round2(gross),
       itemDiscountTotal: round2(itemDisc),
@@ -490,16 +491,13 @@ function NewSaleModal({ onClose, onCreated }) {
     };
   }, [items, billDisc]);
   const total = calc.total;
-  const paidSum = (Number(pay.cash) || 0) + (Number(pay.upi) || 0) + (Number(pay.bank) || 0);
-  const paid = paidSum;
-  const due = Math.max(0, total - paidSum);
-  const overpayment = Math.max(0, paidSum - total);
+  const payment = calculateCheckoutPayment(total, pay);
 
   const lineNet = (it) => {
-    const g = it.unitPrice * it.quantity;
+    const g = round2(round2(it.unitPrice) * it.quantity);
     const dv = Number(it.discountValue) || 0;
-    const d = it.discountType === "percent" ? (g * Math.min(100, dv)) / 100 : Math.min(dv, g);
-    return round2(g - d);
+    const d = round2(Math.max(0, it.discountType === "percent" ? (g * Math.min(100, dv)) / 100 : Math.min(dv, g)));
+    return round2(Math.max(0, g - d));
   };
   const updateItem = (productId, patch) =>
     setItems((prev) => prev.map((it) => (it.productId === productId ? { ...it, ...patch } : it)));
@@ -560,22 +558,29 @@ function NewSaleModal({ onClose, onCreated }) {
     })));
   };
 
-  const markFullCash = () => setPay({ cash: String(total - (Number(pay.upi) || 0) - (Number(pay.bank) || 0)), upi: pay.upi, bank: pay.bank });
+  const markFullCash = () => {
+    const calculation = calculateCheckoutPayment(total, { ...pay, cash: "" });
+    if (calculation.error) {
+      toast.error(calculation.error);
+      return;
+    }
+    setPay({ ...pay, cash: String(calculation.remainingCash) });
+  };
 
   const submit = async () => {
     if (!step1Valid || items.length === 0) return;
-    if (overpayment > 0) {
-      toast.error("Payment splits cannot exceed the sale total.");
+    if (payment.error) {
+      toast.error(payment.error);
       return;
     }
-    if (customerType === "walkin" && due > 0) {
+    if (customerType === "walkin" && payment.due > 0) {
       toast.error("Walk-in sales must be fully paid.");
       return;
     }
     const payments = [
-      { method: "cash", amount: Number(pay.cash) || 0 },
       { method: "upi", amount: Number(pay.upi) || 0 },
       { method: "bank", amount: Number(pay.bank) || 0 },
+      { method: "card", amount: Number(pay.card) || 0 },
     ].filter((p) => p.amount > 0);
 
     const payload = {
@@ -589,7 +594,14 @@ function NewSaleModal({ onClose, onCreated }) {
         discountValue: Number(it.discountValue) || 0,
       })),
       billDiscount: { type: billDisc.type, value: Number(billDisc.value) || 0 },
+      expectedTotal: total,
+      reviewedItems: items.map((it) => ({
+        productId: it.productId,
+        quantity: it.quantity,
+        unitPrice: round2(it.unitPrice),
+      })),
       payments,
+      ...(pay.cash !== "" ? { cashTendered: pay.cash } : {}),
     };
     if (customerType === "existing") payload.customerId = customer._id;
     if (customerType === "new") payload.newCustomer = newCustomer;
@@ -617,7 +629,7 @@ function NewSaleModal({ onClose, onCreated }) {
           <div className="text-sm">
             <span className="text-ink-500">Total: </span>
             <span className="font-bold text-ink-900">{formatINR(total)}</span>
-            {step === 3 && due > 0 && <span className="text-rose-500 ml-2">· Due {formatINR(due)}</span>}
+            {step === 3 && payment.due > 0 && <span className="text-rose-500 ml-2">· Due {formatINR(payment.due)}</span>}
           </div>
           <div className="flex gap-2">
             {financialMutation.pending && (
@@ -638,7 +650,7 @@ function NewSaleModal({ onClose, onCreated }) {
               </button>
             )}
             {step === 3 && (
-              <button onClick={submit} disabled={financialMutation.submitting || overpayment > 0} className="btn-primary">
+              <button onClick={submit} disabled={financialMutation.submitting || Boolean(payment.error)} className="btn-primary">
                 {financialMutation.submitting ? "Recording…" : "Record sale"}
               </button>
             )}
@@ -809,12 +821,12 @@ function NewSaleModal({ onClose, onCreated }) {
                         <div className="font-semibold text-sm text-ink-800 truncate">{p.name}</div>
                         <div className="text-xs text-ink-500">{[p.sku, p.color, p.size].filter(Boolean).join(" · ")} · {p.stock} in stock</div>
                         <div className="text-[11px] text-ink-400">
-                          Wholesale {formatINR(p.wholesalePrice ?? p.sellingPrice)} · Retail {formatINR(p.retailPrice ?? ((p.wholesalePrice ?? p.sellingPrice) * 2))}
+                          Wholesale {formatINR(round2(p.wholesalePrice ?? p.sellingPrice))} · Retail {formatINR(round2(p.retailPrice ?? ((p.wholesalePrice ?? p.sellingPrice) * 2)))}
                         </div>
                       </div>
                       <div className="text-right shrink-0">
                         <div className="text-[10px] uppercase tracking-wide text-ink-400">{saleType}</div>
-                        <div className="text-sm font-bold text-brand-600">{formatINR(saleType === "retail" ? p.retailPrice : p.wholesalePrice ?? p.sellingPrice)}</div>
+                        <div className="text-sm font-bold text-brand-600">{formatINR(round2(saleType === "retail" ? p.retailPrice ?? ((p.wholesalePrice ?? p.sellingPrice) * 2) : p.wholesalePrice ?? p.sellingPrice))}</div>
                       </div>
                     </button>
                   ))}
@@ -840,14 +852,14 @@ function NewSaleModal({ onClose, onCreated }) {
                 ) : (
                   <div className="space-y-2 max-h-80 overflow-y-auto">
                     {items.map((it) => {
-                      const gross = it.unitPrice * it.quantity;
+                      const gross = round2(round2(it.unitPrice) * it.quantity);
                       const net = lineNet(it);
                       return (
                         <div key={it.productId} className="card !p-3">
                           <div className="flex items-center gap-3">
                             <div className="flex-1 min-w-0">
                               <div className="font-semibold text-sm text-ink-800 truncate">{it.name}</div>
-                              <div className="text-xs text-ink-500">{formatINR(it.unitPrice)} each</div>
+                              <div className="text-xs text-ink-500">{formatINR(round2(it.unitPrice))} each</div>
                             </div>
                             <div className="flex items-center gap-1 bg-ink-50 rounded-lg px-1">
                               <button onClick={() => updateQty(it.productId, it.quantity - 1)} className="w-7 h-7 text-ink-600 hover:text-brand-500">−</button>
@@ -960,20 +972,21 @@ function NewSaleModal({ onClose, onCreated }) {
                 </div>
                 <div className="space-y-2">
                   {[
-                    { key: "cash", label: "Cash", color: "#10b981" },
+                    { key: "cash", label: "Cash tendered", color: "#10b981" },
                     { key: "upi", label: "UPI", color: "#3849f5" },
                     { key: "bank", label: "Bank", color: "#8b5cf6" },
+                    { key: "card", label: "Card", color: "#ec4899" },
                   ].map((m) => (
                     <div key={m.key} className="flex items-center gap-3">
-                      <span className="flex items-center gap-2 w-20 text-sm text-ink-600">
+                      <span className="flex items-center gap-2 w-32 text-sm text-ink-600">
                         <span className="w-2.5 h-2.5 rounded-full" style={{ background: m.color }} />
                         {m.label}
                       </span>
                       <div className="flex-1 relative">
                         <span className="absolute left-3 top-1/2 -translate-y-1/2 text-ink-400 text-sm">₹</span>
                         <input
-                          type="number"
-                          min="0"
+                          type="text"
+                          inputMode="decimal"
                           value={pay[m.key]}
                           onChange={(e) => setPay({ ...pay, [m.key]: e.target.value })}
                           className="input !pl-7 !py-2"
@@ -988,25 +1001,24 @@ function NewSaleModal({ onClose, onCreated }) {
               {/* Totals */}
               <div className="card !py-3 space-y-1.5">
                 <div className="flex items-center justify-between text-sm">
-                  <span className="text-ink-500">Paid</span>
-                  <span className="font-semibold text-emerald-500">{formatINR(paid)}</span>
+                  <span className="text-ink-500">Invoice amount</span>
+                  <span className="font-semibold">{formatINR(total)}</span>
                 </div>
-                {overpayment > 0 && (
-                  <div className="flex items-center justify-between text-sm">
-                    <span className="text-rose-500">Overpayment not allowed</span>
-                    <span className="font-semibold text-rose-500">{formatINR(overpayment)}</span>
-                  </div>
-                )}
+                {payment.error ? <div className="text-sm text-rose-500">{payment.error}</div> : <>
+                  <div className="flex items-center justify-between text-sm"><span>Cash applied</span><span>{formatINR(payment.cashApplied)}</span></div>
+                  <div className="flex items-center justify-between text-sm"><span>Change returned</span><span>{formatINR(payment.change)}</span></div>
+                  <div className="flex items-center justify-between text-sm"><span>Amount collected</span><span className="font-semibold text-emerald-500">{formatINR(payment.paid)}</span></div>
                 <div className="flex items-center justify-between">
                   <span className="font-semibold text-ink-700">Due</span>
-                  <span className={`font-display font-extrabold text-lg ${due > 0 ? "text-rose-500" : "text-emerald-500"}`}>{formatINR(due)}</span>
+                  <span className={`font-display font-extrabold text-lg ${payment.due > 0 ? "text-rose-500" : "text-emerald-500"}`}>{formatINR(payment.due)}</span>
                 </div>
-                {due > 0 && customerType !== "walkin" && (
-                  <div className="text-xs text-ink-400 pt-1">{formatINR(due)} will be added to {displayName}'s pending balance.</div>
+                {payment.due > 0 && customerType !== "walkin" && (
+                  <div className="text-xs text-ink-400 pt-1">{formatINR(payment.due)} will be added to {displayName}'s pending balance.</div>
                 )}
-                {due > 0 && customerType === "walkin" && (
+                {payment.due > 0 && customerType === "walkin" && (
                   <div className="text-xs text-rose-500 pt-1">Walk-in sales must be fully paid before recording.</div>
                 )}
+                </>}
               </div>
             </div>
           )}
@@ -1224,6 +1236,10 @@ function InvoiceModal({ invoice, onClose, onChanged }) {
             )}
             {invoice.payments?.length > 0 &&
               invoice.payments.map((p, i) => <Row key={i} label={methodLabel[p.method] || p.method} value={formatINR(p.amount)} muted />)}
+            {invoice.cashTendered != null && invoice.cashChange != null && <>
+              <Row label="Original cash tendered" value={formatINR(invoice.cashTendered)} muted />
+              <Row label="Original change returned" value={formatINR(invoice.cashChange)} muted />
+            </>}
             <Row label="Paid" value={formatINR(invoice.amountPaid)} positive />
             <Row label="Due" value={formatINR(invoice.dueAmount)} negative={invoice.dueAmount > 0} bold />
           </div>

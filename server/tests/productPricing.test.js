@@ -5,6 +5,7 @@ const {
   wholesalePrice,
   retailPrice,
   salePrice,
+  initialSalePrice,
   normalizeProductPrices,
   serializeProduct,
 } = require("../utils/productPricing");
@@ -15,6 +16,20 @@ test("legacy selling price remains the wholesale price with a 2x retail fallback
   assert.equal(retailPrice(product), 250);
   assert.equal(salePrice(product, "wholesale"), 125);
   assert.equal(salePrice(product, "retail"), 250);
+});
+
+test("new checkout safeguards and cash tender always use server prices while legacy pricing remains compatible", () => {
+  const product = { sellingPrice: 100, wholesalePrice: 90, retailPrice: 145 };
+  const item = { unitPrice: 1 };
+  for (const body of [
+    { saleType: "wholesale" },
+    { expectedTotal: 1 },
+    { reviewedItems: [] },
+    { cashTendered: 1 },
+  ]) assert.equal(initialSalePrice(product, "wholesale", item, body), 90);
+  assert.equal(initialSalePrice(product, "retail", item, { cashTendered: 1 }), 145);
+  assert.equal(initialSalePrice(product, "wholesale", item, {}), 1);
+  assert.equal(initialSalePrice(product, "wholesale", {}, {}), 90);
 });
 
 test("explicit wholesale and retail prices are selected and serialized", () => {

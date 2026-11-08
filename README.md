@@ -155,6 +155,31 @@ the customer's oldest outstanding sales. Replacement carry-forward is tracked
 separately from tender, so it is not counted as a collection. Returns allocate
 bill discounts proportionately across line items and quantities.
 
+For initial sale checkout, clients may send `cashTendered` as a non-negative
+amount with at most two decimal places, together with a `payments` array
+containing only positive non-cash splits. The server applies non-cash payments
+first, applies cash up to the remaining invoice amount, and records the excess
+as `cashChange`. Cash splits, `amountPaid`, `paymentMethod`, and client-supplied
+`cashChange` cannot be combined with `cashTendered`. Without `cashTendered`,
+existing payment fields continue to represent amounts collected. Payment inputs
+on initial checkout must have at most two decimal places. Positive cash tender
+is rejected on a zero-value invoice. Tender and change are optional original
+checkout snapshots and are not inferred for older sales; they are not refunds.
+Initial sale requests may also include `expectedTotal` as a non-negative
+amount with at most two decimal places. The server compares it with its
+authoritative total and returns a conflict if they differ; it is never used
+to calculate or record the sale. Existing callers may omit this field.
+Checkout may also send `reviewedItems`, an array containing one entry per
+product with `productId`, `quantity`, and the reviewed `unitPrice` rounded to
+paise. The server compares these against its prepared item prices and quantities
+and rejects missing, duplicate, unexpected, or changed lines before reserving
+the idempotency key. The snapshot is only a comparison and never sets sale
+prices. Existing callers may omit it.
+Requests with `cashTendered`, `expectedTotal`, `reviewedItems`, or a sale type
+use server product prices. For compatibility, legacy requests omitting all
+four can still supply an item `unitPrice`; those callers do not have the same
+server-authoritative pricing guarantee.
+
 The web client persists the pending key per tab and endpoint, reuses it only for
 the same request payload, and keeps failed transaction forms available for retry.
 To start a changed request after a failure, explicitly discard the pending

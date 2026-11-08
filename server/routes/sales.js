@@ -17,13 +17,16 @@ const {
   computeReturnSettlement,
   computeReplacementCredit,
   normalizePaymentSplits,
+  normalizeCheckoutPayments,
+  validateExpectedTotal,
+  validateReviewedItems,
   round2,
 } = require("../utils/saleMath");
 const ReturnRecord = require("../models/ReturnRecord");
 const { clampLimit, clampPage, posInt, pageMeta } = require("../utils/validate");
 const { decrementStock, getStockRequirements } = require("../services/stockService");
 const { restoreBatchStock, returnedBatchAllocations } = require("../services/stockBatchService");
-const { salePrice, wholesalePrice, retailPrice } = require("../utils/productPricing");
+const { salePrice, initialSalePrice, wholesalePrice, retailPrice } = require("../utils/productPricing");
 const {
   executeIdempotently,
   requestFingerprint,
@@ -287,21 +290,8 @@ router.use(protect);
 
 // Normalize split tender while retaining the legacy { amountPaid, paymentMethod } shape.
 function normalizePayments(body, maximum) {
-  let requested;
-  if (Array.isArray(body.payments)) {
-    requested = body.payments;
-  } else if (body.amountPaid != null && Number(body.amountPaid) !== 0) {
-    requested = [{ method: body.paymentMethod || "cash", amount: body.amountPaid }];
-  } else {
-    requested = [];
-  }
   try {
-    const payments = normalizePaymentSplits(requested, maximum);
-    const amountPaid = round2(payments.reduce((sum, payment) => sum + payment.amount, 0));
-    const summaryMethod = payments.length > 1
-      ? "split"
-      : payments.length === 1 ? payments[0].method : "cash";
-    return { payments, amountPaid, summaryMethod };
+    return normalizeCheckoutPayments(body, maximum);
   } catch (error) {
     error.status = 400;
     throw error;
@@ -353,7 +343,7 @@ router.post(
       operation: "sale-create",
       key,
       fingerprint,
-      work: async (session) => {
+      prepare: async (session) => {
         const { items, notes = "" } = req.body;
         const customerType = req.body.customerType || "existing";
         const saleType = req.body.saleType || "wholesale";
@@ -363,8 +353,15 @@ router.post(
         if (!Array.isArray(items) || items.length === 0) {
           throw httpError(400, "At least one item is required");
         }
+        if (Object.prototype.hasOwnProperty.call(req.body, "reviewedItems")) {
+          validateReviewedItems(req.body, items.map((item) => ({
+            product: item?.productId,
+            quantity: Number(item?.quantity),
+          })), { checkPrices: false });
+        }
 
         let customer = null;
+        let newCustomer = null;
         let customerName = "Walk-in Customer";
         if (customerType === "walkin") {
           customerName = req.body.walkInName?.trim() || "Walk-in Customer";
@@ -373,16 +370,16 @@ router.post(
           if (!nc.name || !nc.phone) throw httpError(400, "New customer needs a name and phone");
           customer = await Customer.findOne({ owner: req.user._id, phone: nc.phone }).session(session);
           if (!customer) {
-            [customer] = await Customer.create([{
+            newCustomer = {
               owner: req.user._id,
               name: nc.name,
               phone: nc.phone,
               shopName: nc.shopName || "",
               address: nc.address || "",
               gstNumber: nc.gstNumber || "",
-            }], { session });
+            };
           }
-          customerName = customer.name;
+          customerName = customer ? customer.name : nc.name;
         } else if (customerType === "existing") {
           customer = await Customer.findOne({ _id: req.body.customerId, owner: req.user._id }).session(session);
           if (!customer) throw httpError(404, "Customer not found");
@@ -394,7 +391,7 @@ router.post(
         const rawItems = [];
         const products = new Map();
         for (const item of items) {
-          const productId = String(item.productId || "");
+          const productId = String(item.productId || "").toLowerCase();
           let product = products.get(productId);
           if (!product) {
             product = await Product.findOne({ _id: productId, owner: req.user._id }).session(session);
@@ -415,14 +412,16 @@ router.post(
             wholesalePrice: wholesalePrice(product),
             retailPrice: retailPrice(product),
             quantity,
-            unitPrice: req.body.saleType
-              ? salePrice(product, saleType)
-              : Number(item.unitPrice ?? wholesalePrice(product)),
+            unitPrice: initialSalePrice(product, saleType, item, req.body),
             costPrice: Number(product.costPrice) || 0,
             discountType: item.discountType === "percent" ? "percent" : "amount",
             discountValue: Number(item.discountValue) || 0,
           });
         }
+
+        const computed = computeSaleTotals({ items: rawItems, billDiscount: req.body.billDiscount });
+        validateReviewedItems(req.body, computed.items);
+        validateExpectedTotal(req.body, computed.total);
 
         for (const [productId, quantity] of getStockRequirements(rawItems)) {
           const product = products.get(productId);
@@ -431,13 +430,17 @@ router.post(
           }
         }
 
-        const computed = computeSaleTotals({ items: rawItems, billDiscount: req.body.billDiscount });
-        const { payments, amountPaid: paid, summaryMethod } = normalizePayments(req.body, computed.total);
-        const due = round2(computed.total - paid);
+        const { payments, amountPaid: paid, dueAmount: due, summaryMethod, cashTendered, cashChange } = normalizePayments(req.body, computed.total);
         if (customerType === "walkin" && due > 0) {
           throw httpError(400, "Walk-in sales must be fully paid (no ledger to track a balance).");
         }
         const paymentStatus = due === 0 ? "paid" : paid > 0 ? "partial" : "unpaid";
+        return { notes, customerType, saleType, customer, newCustomer, customerName, computed, payments, paid, due, summaryMethod, cashTendered, cashChange, paymentStatus };
+      },
+      work: async (session, prepared) => {
+        let { customer } = prepared;
+        const { notes, customerType, saleType, newCustomer, customerName, computed, payments, paid, due, summaryMethod, cashTendered, cashChange, paymentStatus } = prepared;
+        if (newCustomer) [customer] = await Customer.create([newCustomer], { session });
         const invoiceNumber = await invoiceService.nextInvoiceNumber(req.user._id, new Date(), session);
         const collectedAt = new Date();
         await decrementStock({ Product, StockBatch, items: computed.items, ownerId: req.user._id, session });
@@ -461,6 +464,7 @@ router.post(
           total: computed.total,
           payments: payments.map((payment) => ({ ...payment, source: "sale", collectedAt })),
           collectionPayments: payments.map((payment) => ({ ...payment, source: "sale", collectedAt })),
+          ...(cashTendered !== undefined ? { cashTendered, cashChange } : {}),
           amountPaid: paid,
           dueAmount: due,
           paymentMethod: summaryMethod,
@@ -574,6 +578,8 @@ router.get(
         netTotal: round2((sale.total || 0) - (sale.returnedAmount || 0)),
         returnStatus: sale.returnStatus || "none",
         payments: sale.payments,
+        ...(sale.cashTendered !== undefined && sale.cashChange !== undefined
+          ? { cashTendered: sale.cashTendered, cashChange: sale.cashChange } : {}),
         amountPaid: sale.amountPaid,
         creditApplied: sale.creditApplied || 0,
         dueAmount: sale.dueAmount,
