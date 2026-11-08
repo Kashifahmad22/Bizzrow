@@ -11,6 +11,7 @@ const ReturnRecord = require("../models/ReturnRecord");
 const { decrementStock } = require("../services/stockService");
 const { allocateReturnItems, computeReturnSettlement } = require("../utils/saleMath");
 const { refundCollectionPipeline } = require("../utils/collectionReconciliation");
+const { connectIsolatedMongo } = require("./helpers/isolatedMongo");
 const {
   executeIdempotently,
   idempotencyIdentity,
@@ -22,16 +23,9 @@ const mongoUri = process.env.FINANCIAL_TEST_MONGO_URI;
 
 test("Mongo transactions roll back failures, prevent concurrent overselling and over-returns, and deduplicate retries", {
   skip: mongoUri ? false : "Set FINANCIAL_TEST_MONGO_URI to an isolated test replica-set database",
-}, async () => {
-  const parsedUri = new URL(mongoUri);
-  const databaseName = decodeURIComponent(parsedUri.pathname.replace(/^\/+/, ""));
-  if (!/(^test|[-_]test|testing)/i.test(databaseName)) {
-    throw new Error("FINANCIAL_TEST_MONGO_URI must target a database whose name clearly contains 'test'");
-  }
-  if (!["localhost", "127.0.0.1", "[::1]"].includes(parsedUri.hostname.toLowerCase())) {
-    throw new Error("FINANCIAL_TEST_MONGO_URI must target an isolated loopback-hosted test replica set");
-  }
-  await mongoose.connect(mongoUri, { autoIndex: false });
+}, async (t) => {
+  t.after(() => mongoose.disconnect());
+  await connectIsolatedMongo(mongoUri, [Product, Counter, Customer, Sale, LedgerEntry, ReturnRecord]);
   const ownerId = new mongoose.Types.ObjectId();
   const fixtureId = new mongoose.Types.ObjectId();
   const customerId = new mongoose.Types.ObjectId();
@@ -108,6 +102,47 @@ test("Mongo transactions roll back failures, prevent concurrent overselling and 
     assert.equal(await Sale.exists({ _id: saleId }), null);
     assert.equal(await LedgerEntry.exists({ reference: saleId }), null);
 
+    const failedKey = `rollback-${crypto.randomUUID()}`;
+    const failedIdentity = idempotencyIdentity(ownerId, operation, failedKey);
+    await assert.rejects(executeIdempotently({
+      ownerId, operation, key: failedKey, fingerprint: requestFingerprint(operation, {}, {}),
+      work: async (session) => {
+        await Product.updateOne({ _id: fixtureId }, { $inc: { stock: -1 } }, { session });
+        await Customer.updateOne({ _id: customerId }, { $inc: { pendingBalance: 1 } }, { session });
+        throw new Error("forced idempotent failure");
+      },
+      replay: async () => { throw new Error("must not replay"); },
+    }), /forced idempotent failure/);
+    assert.equal(await Counter.exists({ _id: failedIdentity }), null);
+    assert.equal((await Product.findById(fixtureId)).stock, 8);
+    assert.equal((await Customer.findById(customerId)).pendingBalance, 0);
+
+    let attempts = 0;
+    await runFinancialTransaction(async (session) => {
+      attempts += 1;
+      await Product.updateOne({ _id: fixtureId }, { $inc: { stock: 1 } }, { session });
+      if (attempts === 1) {
+        const error = new mongoose.mongo.MongoServerError({ message: "synthetic transient transaction error" });
+        error.addErrorLabel("TransientTransactionError");
+        throw error;
+      }
+    });
+    assert.equal(attempts, 2);
+    assert.equal((await Product.findById(fixtureId)).stock, 9);
+    await Product.updateOne({ _id: fixtureId }, { $set: { stock: 8 } });
+
+    const duplicateKey = `duplicate-${crypto.randomUUID()}`;
+    const duplicateIdentity = idempotencyIdentity(ownerId, operation, duplicateKey);
+    await assert.rejects(executeIdempotently({
+      ownerId, operation, key: duplicateKey, fingerprint: requestFingerprint(operation, {}, {}),
+      work: async (session) => {
+        await Customer.create([{ owner: ownerId, name: "Duplicate", phone: customer.phone }], { session });
+        throw new Error("duplicate index was not enforced");
+      },
+      replay: async () => { throw new Error("unrelated duplicate must not replay"); },
+    }), (error) => error.code === 11000);
+    assert.equal(await Counter.exists({ _id: duplicateIdentity }), null);
+
     await Product.updateOne({ _id: fixture._id }, { $set: { stock: 5 } });
     const concurrentSale = () => runFinancialTransaction((session) => decrementStock({
       Product,
@@ -133,8 +168,7 @@ test("Mongo transactions roll back failures, prevent concurrent overselling and 
     });
     const soldCountBefore = (await Product.findById(fixture._id)).soldCount;
     const idempotentResults = await Promise.all([execute(), execute()]);
-    assert.equal(idempotentResults.filter((result) => result === "created").length, 1);
-    assert.equal(idempotentResults.filter((result) => result === "replayed").length, 1);
+    assert.deepEqual(idempotentResults, ["created", "created"]);
     const soldCountAfter = (await Product.findById(fixture._id)).soldCount;
     assert.equal(soldCountAfter - soldCountBefore, 1);
 

@@ -1,12 +1,13 @@
 const crypto = require("crypto");
+const { add, subtract } = require("../utils/quantity");
 
 function summarizeBatchStock(productStock, batches) {
   const stock = Math.max(0, Number(productStock) || 0);
-  const batchRemaining = batches.reduce((sum, batch) => sum + (Number(batch.remainingQuantity) || 0), 0);
+  const batchRemaining = batches.reduce((sum, batch) => add(sum, Number(batch.remainingQuantity) || 0), 0);
   return {
     stock,
     batchRemaining,
-    legacyUnbatchedStock: Math.max(0, stock - batchRemaining),
+    legacyUnbatchedStock: Math.max(0, subtract(stock, batchRemaining)),
     inconsistent: batchRemaining > stock,
   };
 }
@@ -23,7 +24,7 @@ function allocateBatchQuantities(batches, quantity) {
       quantity: amount,
       costPrice: batch.costPrice == null ? null : Number(batch.costPrice),
     });
-    remaining -= amount;
+    remaining = subtract(remaining, amount);
   }
   return { allocations, legacyQuantity: remaining };
 }
@@ -43,15 +44,15 @@ function distributeBatchAllocations(items, allocationsByProduct) {
     const allocations = source.allocations;
     let remaining = Number(item.quantity) || 0;
     item.legacyQuantityFirst = Math.min(remaining, source.legacyQuantity);
-    source.legacyQuantity -= item.legacyQuantityFirst;
-    remaining -= item.legacyQuantityFirst;
+    source.legacyQuantity = subtract(source.legacyQuantity, item.legacyQuantityFirst);
+    remaining = subtract(remaining, item.legacyQuantityFirst);
     const assigned = [];
     while (remaining > 0 && allocations.length) {
       const allocation = allocations[0];
       const quantity = Math.min(remaining, allocation.quantity);
       assigned.push({ ...allocation, quantity });
-      allocation.quantity -= quantity;
-      remaining -= quantity;
+      allocation.quantity = subtract(allocation.quantity, quantity);
+      remaining = subtract(remaining, quantity);
       if (allocation.quantity === 0) allocations.shift();
     }
     item.batchAllocations = assigned;
@@ -64,22 +65,22 @@ function returnedBatchAllocations(item, quantity) {
   let remaining = quantity;
   const result = [];
   const legacyFirst = Math.max(0, Number(item.legacyQuantityFirst) || 0);
-  const legacyReturned = Math.min(remaining, Math.max(0, legacyFirst - start));
-  remaining -= legacyReturned;
-  start = Math.max(0, start - legacyFirst);
+  const legacyReturned = Math.min(remaining, Math.max(0, subtract(legacyFirst, start)));
+  remaining = subtract(remaining, legacyReturned);
+  start = Math.max(0, subtract(start, legacyFirst));
   for (const allocation of item.batchAllocations || []) {
     if (remaining <= 0) break;
     const allocationQty = Number(allocation.quantity) || 0;
     if (start >= allocationQty) {
-      start -= allocationQty;
+      start = subtract(start, allocationQty);
       continue;
     }
-    const amount = Math.min(remaining, allocationQty - start);
+    const amount = Math.min(remaining, subtract(allocationQty, start));
     if (amount > 0) result.push({ batch: allocation.batch, quantity: amount });
-    remaining -= amount;
+    remaining = subtract(remaining, amount);
     start = 0;
   }
-  return { allocations: result, unbatchedQuantity: legacyReturned + remaining };
+  return { allocations: result, unbatchedQuantity: add(legacyReturned, remaining) };
 }
 
 async function restoreBatchStock({ StockBatch, ownerId, productId, allocations, session }) {
@@ -89,7 +90,7 @@ async function restoreBatchStock({ StockBatch, ownerId, productId, allocations, 
       owner: ownerId,
       product: productId,
     }).session(session);
-    if (!batch || batch.remainingQuantity + allocation.quantity > batch.quantityReceived) {
+    if (!batch || add(batch.remainingQuantity, allocation.quantity) > batch.quantityReceived) {
       throw Object.assign(new Error("Cannot restore batch stock"), { status: 409 });
     }
     const update = await StockBatch.updateOne(
@@ -99,7 +100,7 @@ async function restoreBatchStock({ StockBatch, ownerId, productId, allocations, 
         product: productId,
         remainingQuantity: batch.remainingQuantity,
       },
-      { $inc: { remainingQuantity: allocation.quantity } },
+      { $set: { remainingQuantity: add(batch.remainingQuantity, allocation.quantity) } },
       { session }
     );
     if (update.modifiedCount !== 1) {
@@ -135,13 +136,13 @@ async function addStockBatch({ Product, StockBatch, ownerId, productId, batch, s
   }], { session });
   const updated = await Product.updateOne(
     { _id: product._id, owner: ownerId, stock: product.stock },
-    { $inc: { stock: batch.quantityReceived } },
+    { $set: { stock: add(product.stock, batch.quantityReceived) }, $inc: { stockRevision: 1 } },
     { session }
   );
   if (updated.modifiedCount !== 1) {
     throw Object.assign(new Error("Product stock changed during batch creation; retry the operation"), { status: 409 });
   }
-  return { batch: created, stock: product.stock + batch.quantityReceived };
+  return { batch: created, stock: add(product.stock, batch.quantityReceived) };
 }
 
 async function loadProductBatches(StockBatch, ownerId, productId, session) {

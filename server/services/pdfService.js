@@ -10,6 +10,7 @@
 
 const PDFDocument = require("pdfkit");
 const { buildInvoicePdfDocument } = require("./invoicePdf");
+const { drawBusinessLogo } = require("../utils/businessLogo");
 
 const INK = "#161a2b";
 const MUTED = "#7a8198";
@@ -19,17 +20,6 @@ const LINE = "#e6e8f0";
 function rupee(n) {
   const v = Number(n || 0);
   return `Rs. ${v.toLocaleString("en-IN")}`;
-}
-
-function logoBuffer(dataUrl) {
-  if (!dataUrl || typeof dataUrl !== "string") return null;
-  const m = dataUrl.match(/^data:(image\/(png|jpe?g));base64,(.+)$/i);
-  if (!m) return null; // pdfkit only supports PNG/JPEG
-  try {
-    return Buffer.from(m[3], "base64");
-  } catch {
-    return null;
-  }
 }
 
 function buildInvoicePdf(sale, business = {}, customer = {}, options = {}) {
@@ -82,16 +72,8 @@ function buildLedgerStatementPdf(customer = {}, business = {}, statement = {}) {
       }
 
       // ---- First-page header ----
-      const logo = logoBuffer(business.logo);
       let hx = pageLeft;
-      if (logo) {
-        try {
-          doc.image(logo, pageLeft, 50, { fit: [48, 48] });
-          hx = pageLeft + 62;
-        } catch {
-          hx = pageLeft;
-        }
-      }
+      if (drawBusinessLogo(doc, business.logo, pageLeft, 46, 54, 48)) hx = pageLeft + 64;
       doc.fillColor(INK).font("Helvetica-Bold").fontSize(18).text(brandName, hx, 54, { lineBreak: false });
       const contact = [business.phone ? `Phone: ${business.phone}` : null, business.gstNumber ? `GST: ${business.gstNumber}` : null]
         .filter(Boolean)

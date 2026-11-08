@@ -17,28 +17,35 @@ import { useState } from "react";
 import { useAuth } from "../context/AuthContext.jsx";
 import { useTheme } from "../context/ThemeContext.jsx";
 import { initials } from "../lib/format.js";
+import BusinessLogo from "./BusinessLogo.jsx";
 import clsx from "clsx";
+import toast from "react-hot-toast";
 
 const NAV = [
   { to: "/app", label: "Dashboard", icon: LayoutDashboard, end: true },
   { to: "/app/sales", label: "Sales", icon: ShoppingBag },
   { to: "/app/products", label: "Products", icon: Package },
+  { to: "/app/inventory-audits", label: "Inventory audits", icon: Package },
   { to: "/app/ledger", label: "Ledger", icon: Wallet },
   { to: "/app/ai", label: "Intelligence", icon: Sparkles },
   { to: "/app/whatsapp", label: "WhatsApp", icon: MessageCircle },
   { to: "/app/settings", label: "Settings", icon: SettingsIcon },
 ];
 
-const BOTTOM_NAV = NAV.slice(0, 5); // 5 most used for mobile bottom bar
+const BOTTOM_NAV = NAV.filter((entry) => ["/app", "/app/sales", "/app/products", "/app/ledger", "/app/ai"].includes(entry.to));
 
 export default function AppShell() {
   const { user, logout } = useAuth();
   const navigate = useNavigate();
   const [drawerOpen, setDrawerOpen] = useState(false);
 
-  const doLogout = () => {
-    logout();
-    navigate("/login");
+  const doLogout = async () => {
+    try {
+      await logout();
+      navigate("/login");
+    } catch (error) {
+      toast.error(error.message || "Could not log out. Please try again.");
+    }
   };
 
   return (
@@ -121,17 +128,12 @@ function BrandIdentity({ business, compact }) {
   const name = business?.name || "Your Shop";
   return (
     <div className="flex items-center gap-3 min-w-0">
-      {business?.logo ? (
-        <img
-          src={business.logo}
-          alt={name}
-          className="w-10 h-10 rounded-xl object-cover border border-ink-200/60 shrink-0"
-        />
-      ) : (
-        <div className="w-10 h-10 rounded-xl bg-gradient-brand flex items-center justify-center shadow-glow shrink-0">
-          <span className="text-white font-extrabold text-sm">{initials(name)}</span>
-        </div>
-      )}
+      <BusinessLogo
+        logo={business?.logo}
+        name={name}
+        className="w-10 h-10 rounded-xl border border-ink-200/60"
+        fallbackClassName="text-brand-500 font-extrabold text-sm"
+      />
       {!compact && (
         <div className="leading-tight min-w-0">
           <div className="font-extrabold text-ink-900 font-display text-base truncate">{name}</div>

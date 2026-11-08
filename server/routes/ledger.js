@@ -4,19 +4,28 @@ const LedgerEntry = require("../models/LedgerEntry");
 const Sale = require("../models/Sale");
 const asyncHandler = require("../utils/asyncHandler");
 const { protect } = require("../middleware/auth");
+const { customerId } = require("../utils/customerInput");
 const whatsapp = require("../services/whatsappService");
 const { buildLedgerStatementPdf } = require("../services/pdfService");
-const { round2 } = require("../utils/saleMath");
+const { round2, paymentPaise } = require("../utils/saleMath");
 const { allocateLedgerPayment } = require("../services/paymentAllocation");
 const { buildLedgerStatement } = require("../services/ledgerStatement");
 const {
   executeIdempotently,
-  requestFingerprint,
   requireIdempotencyKey,
+  resourceIdempotency,
 } = require("../services/financialTransaction");
 
 const router = express.Router();
 router.use(protect);
+router.param("customerId", (req, res, next, value) => {
+  try {
+    req.params.customerId = customerId(value);
+    next();
+  } catch (error) {
+    next(error);
+  }
+});
 
 // Compute a ledger statement: opening balance (signed sum before `from`),
 // running balance per in-range entry, and closing balance. Reused by JSON + PDF.
@@ -47,24 +56,28 @@ router.post(
   "/:customerId/payment",
   asyncHandler(async (req, res) => {
     const key = requireIdempotencyKey(req);
-    const fingerprint = requestFingerprint("ledger:payment", { customerId: req.params.customerId }, req.body);
+    const identity = resourceIdempotency({ resourceId: req.params.customerId, operation: "ledger-payment", fingerprintOperation: "ledger:payment", parameter: "customerId", body: req.body });
     const result = await executeIdempotently({
       ownerId: req.user._id,
-      operation: `ledger-payment:${req.params.customerId}`,
+      ...identity,
       key,
-      fingerprint,
       work: async (session) => {
-        const amount = Number(req.body.amount);
         const paymentMethod = req.body.paymentMethod || "cash";
-        const normalizedAmount = round2(amount);
-        if (!Number.isFinite(amount) || normalizedAmount <= 0) {
+        let normalizedAmount;
+        try {
+          normalizedAmount = paymentPaise(req.body.amount) / 100;
+        } catch (error) {
+          error.status = 400;
+          throw error;
+        }
+        if (normalizedAmount <= 0) {
           throw Object.assign(new Error("Positive amount of at least 0.01 is required"), { status: 400 });
         }
         if (!["cash", "upi", "bank", "card"].includes(paymentMethod)) {
           throw Object.assign(new Error("Payment method must be cash, upi, bank, or card"), { status: 400 });
         }
         const customer = await Customer.findOne({
-          _id: req.params.customerId,
+          _id: identity.resourceId,
           owner: req.user._id,
         }).session(session);
         if (!customer) throw Object.assign(new Error("Customer not found"), { status: 404 });

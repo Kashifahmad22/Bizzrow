@@ -3,7 +3,8 @@ const crypto = require("crypto");
 const jwt = require("jsonwebtoken");
 const User = require("../models/User");
 const asyncHandler = require("../utils/asyncHandler");
-const { protect } = require("../middleware/auth");
+const { protect, protectLogout, hashSessionToken } = require("../middleware/auth");
+const RevokedSession = require("../models/RevokedSession");
 const { shouldExposeDevelopmentResetLink } = require("../utils/resetLinkPolicy");
 const mailer = require("../services/mailer");
 
@@ -17,6 +18,7 @@ function hashToken(raw) {
 function signToken(userId, tokenVersion = 0) {
   return jwt.sign({ id: userId, tokenVersion }, process.env.JWT_SECRET, {
     expiresIn: process.env.JWT_EXPIRES_IN || "7d",
+    jwtid: crypto.randomUUID(),
   });
 }
 
@@ -83,6 +85,21 @@ router.get(
   protect,
   asyncHandler(async (req, res) => {
     res.json({ user: publicUser(req.user) });
+  })
+);
+
+router.post(
+  "/logout",
+  protectLogout,
+  asyncHandler(async (req, res) => {
+    const filter = { owner: req.user._id, tokenHash: hashSessionToken(req.sessionToken) };
+    const expiresAt = req.sessionClaims.exp == null ? undefined : new Date(req.sessionClaims.exp * 1000);
+    try {
+      await RevokedSession.updateOne(filter, { $setOnInsert: { ...filter, ...(expiresAt && { expiresAt }) } }, { upsert: true });
+    } catch (error) {
+      if (error.code !== 11000 || !await RevokedSession.exists(filter)) throw error;
+    }
+    res.json({ ok: true });
   })
 );
 

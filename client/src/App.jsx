@@ -17,6 +17,7 @@ import Sales from "./pages/Sales.jsx";
 import AIInsights from "./pages/AIInsights.jsx";
 import WhatsAppPage from "./pages/WhatsApp.jsx";
 import Settings from "./pages/Settings.jsx";
+import InventoryAudits from "./pages/InventoryAudits.jsx";
 
 function Protected({ children }) {
   const { user, loading } = useAuth();
@@ -66,6 +67,7 @@ export default function App() {
         >
           <Route index element={<Dashboard />} />
           <Route path="products" element={<Products />} />
+          <Route path="inventory-audits" element={<InventoryAudits />} />
           <Route path="ledger" element={<Ledger />} />
           <Route path="sales" element={<Sales />} />
           <Route path="ai" element={<AIInsights />} />

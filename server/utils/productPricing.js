@@ -21,6 +21,12 @@ function salePrice(product, saleType = "wholesale") {
   return saleType === "retail" ? retailPrice(product) : wholesalePrice(product);
 }
 
+function initialSalePrice(product, saleType, item, body) {
+  const authoritative = body.saleType || ["expectedTotal", "reviewedItems", "cashTendered"]
+    .some((field) => Object.prototype.hasOwnProperty.call(body, field));
+  return authoritative ? salePrice(product, saleType) : Number(item.unitPrice ?? wholesalePrice(product));
+}
+
 function serializeProduct(product) {
   const result = typeof product.toObject === "function" ? product.toObject() : { ...product };
   result.wholesalePrice = wholesalePrice(result);
@@ -29,7 +35,7 @@ function serializeProduct(product) {
   return result;
 }
 
-function normalizeProductPrices(body, { creating = false } = {}) {
+function normalizeProductPrices(body, { creating = false, current = null } = {}) {
   const wholesale = body.wholesalePrice ?? body.sellingPrice;
   const values = {
     ...(body.wholesalePrice !== undefined || body.sellingPrice !== undefined
@@ -37,19 +43,33 @@ function normalizeProductPrices(body, { creating = false } = {}) {
       : {}),
     ...(body.retailPrice !== undefined ? { retailPrice: body.retailPrice } : {}),
   };
-  if (creating && values.retailPrice == null && values.wholesalePrice != null) {
-    values.retailPrice = Math.round(Number(values.wholesalePrice) * 200) / 100;
-  }
   for (const [field, value] of Object.entries(values)) {
-    const number = Number(value);
-    if (value == null || value === "" || !Number.isFinite(number) || number < 0) {
-      const error = new Error(`${field} must be a non-negative number`);
-      error.status = 400;
-      throw error;
+    const stored = current && (field === "sellingPrice" || field === "wholesalePrice"
+      ? wholesalePrice(current) : retailPrice(current));
+    if (stored != null && (typeof value === "number" || typeof value === "string")
+        && value !== "" && Number(value) === Number(stored)) {
+      values[field] = Number(stored);
+      continue;
     }
-    values[field] = number;
+    values[field] = validateCurrency(value, field);
+  }
+  if (creating && values.retailPrice == null && values.wholesalePrice != null) {
+    const retailPaise = paymentPaise(values.wholesalePrice) * 2;
+    if (!Number.isSafeInteger(retailPaise)) {
+      throw Object.assign(new Error("retailPrice is outside the safe currency range"), { status: 400 });
+    }
+    values.retailPrice = retailPaise / 100;
   }
   return values;
 }
 
-module.exports = { wholesalePrice, retailPrice, salePrice, serializeProduct, normalizeProductPrices };
+module.exports = { wholesalePrice, retailPrice, salePrice, initialSalePrice, serializeProduct, normalizeProductPrices, validateCurrency };
+const { paymentPaise } = require("./saleMath");
+
+function validateCurrency(value, field) {
+  try {
+    return paymentPaise(value) / 100;
+  } catch {
+    throw Object.assign(new Error(`${field} must be a non-negative number with at most two decimal places`), { status: 400 });
+  }
+}

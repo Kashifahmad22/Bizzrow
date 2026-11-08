@@ -10,15 +10,16 @@ const { buildTextFilter } = require("../utils/search");
 const ai = require("../services/aiService");
 const { normalizeExtraction } = require("../utils/ocrNormalize");
 const { clampLimit, clampPage, pageMeta } = require("../utils/validate");
-const { normalizeProductPrices, serializeProduct } = require("../utils/productPricing");
+const { normalizeProductPrices, serializeProduct, validateCurrency } = require("../utils/productPricing");
 const { buildProductCsv, inventoryFilename } = require("../utils/productExport");
 const { detectProductDuplicates } = require("../utils/productDuplicates");
 const { deleteUnusedProduct, isValidProductId } = require("../services/productDeletion");
 const { adjustStock } = require("../services/stockAdjustment");
+const { validateNewQuantity } = require("../utils/quantity");
 const {
   executeIdempotently,
-  requestFingerprint,
   requireIdempotencyKey,
+  resourceIdempotency,
   runFinancialTransaction,
 } = require("../services/financialTransaction");
 const {
@@ -80,7 +81,12 @@ router.get(
   "/",
   asyncHandler(async (req, res) => {
     const { q, status, maxQty, sort } = req.query;
-    const filter = { owner: req.user._id, ...buildTextFilter(q, ["name", "sku", "barcode", "category", "brand", "color", "size"]) };
+    const filter = {
+      owner: req.user._id,
+      ...buildTextFilter(q, ["name", "sku", "barcode", "category", "brand", "color", "size"], {
+        separatorInsensitive: true,
+      }),
+    };
     if (status === "out") filter.stock = 0;
     else if (status === "low") filter.stock = { $gt: 0, $lte: 10 };
     else if (status === "fast") filter.soldCount = { $gte: 5 };
@@ -128,29 +134,18 @@ router.post(
   "/:id/batches",
   asyncHandler(async (req, res) => {
     const key = requireIdempotencyKey(req);
-    const fingerprint = requestFingerprint("product:batch", { productId: req.params.id }, req.body);
-    const quantity = Number(req.body.quantityReceived);
-    if (!Number.isFinite(quantity) || quantity <= 0) {
-      res.status(400);
-      throw new Error("quantityReceived must be a positive number");
-    }
-    const purchaseDate = req.body.purchaseDate ? new Date(req.body.purchaseDate) : new Date();
-    if (!Number.isFinite(purchaseDate.getTime())) {
-      res.status(400);
-      throw new Error("purchaseDate must be a valid date");
-    }
-    const costPrice = req.body.costPrice == null || req.body.costPrice === "" ? null : Number(req.body.costPrice);
-    if (costPrice != null && (!Number.isFinite(costPrice) || costPrice < 0)) {
-      res.status(400);
-      throw new Error("costPrice must be a non-negative number");
-    }
-
+    const identity = resourceIdempotency({ resourceId: req.params.id, operation: "stock-batch", fingerprintOperation: "product:batch", parameter: "productId", body: req.body });
     const result = await executeIdempotently({
       ownerId: req.user._id,
-      operation: `stock-batch:${req.params.id}`,
+      ...identity,
       key,
-      fingerprint,
       work: async (session) => {
+        const quantity = validateNewQuantity(req.body.quantityReceived);
+        const purchaseDate = req.body.purchaseDate ? new Date(req.body.purchaseDate) : new Date();
+        if (!Number.isFinite(purchaseDate.getTime())) {
+          throw Object.assign(new Error("purchaseDate must be a valid date"), { status: 400 });
+        }
+        const costPrice = req.body.costPrice == null || req.body.costPrice === "" ? null : validateCurrency(req.body.costPrice, "costPrice");
         const batchCode = String(req.body.batchCode || makeBatchCode(purchaseDate)).trim();
         if (!batchCode || batchCode.length > 60) {
           throw Object.assign(new Error("batchCode must contain 1 to 60 characters"), { status: 400 });
@@ -159,7 +154,7 @@ router.post(
           Product,
           StockBatch,
           ownerId: req.user._id,
-          productId: req.params.id,
+          productId: identity.resourceId,
           batch: {
             batchCode,
             purchaseDate,
@@ -182,9 +177,9 @@ router.post(
           StockBatch.findOne({
             _id: record.resultId,
             owner: req.user._id,
-            product: req.params.id,
+            product: identity.resourceId,
           }),
-          Product.findOne({ _id: req.params.id, owner: req.user._id }),
+          Product.findOne({ _id: identity.resourceId, owner: req.user._id }),
         ]);
         if (!batch || !product) {
           throw new Error("Idempotent batch record references missing resources");
@@ -209,16 +204,11 @@ router.post(
     for (const f of PRODUCT_FIELDS) if (f in req.body) payload[f] = req.body[f];
     Object.assign(payload, normalizeProductPrices(req.body, { creating: true }));
     if (costPrice != null) {
-      const parsedCost = Number(costPrice);
-      if (!Number.isFinite(parsedCost) || parsedCost < 0) {
-        res.status(400);
-        throw new Error("costPrice must be a non-negative number");
-      }
-      payload.costPrice = parsedCost;
+      payload.costPrice = validateCurrency(costPrice, "costPrice");
     } else {
       payload.costPrice = null;
     }
-    payload.stock = req.body.stock || 0;
+    payload.stock = validateNewQuantity(req.body.stock ?? 0, { allowZero: true });
     const product = await Product.create(payload);
     res.status(201).json({ product: serializeProduct(product) });
   })
@@ -241,14 +231,12 @@ router.put(
       if (["sellingPrice", "wholesalePrice", "retailPrice", "stock"].includes(f)) continue;
       if (f in req.body) product[f] = req.body[f];
     }
-    Object.assign(product, normalizeProductPrices(req.body));
+    Object.assign(product, normalizeProductPrices(req.body, { current: product }));
     if ("costPrice" in req.body) {
-      const cost = req.body.costPrice == null || req.body.costPrice === "" ? null : Number(req.body.costPrice);
-      if (cost != null && (!Number.isFinite(cost) || cost < 0)) {
-        res.status(400);
-        throw new Error("costPrice must be a non-negative number");
-      }
-      product.costPrice = cost;
+      const cost = req.body.costPrice;
+      if (cost == null || cost === "") product.costPrice = null;
+      else if (!(product.costPrice != null && (typeof cost === "number" || typeof cost === "string")
+        && Number(cost) === product.costPrice)) product.costPrice = validateCurrency(cost, "costPrice");
     }
     await product.save();
     res.json({ product: serializeProduct(product) });
@@ -257,23 +245,22 @@ router.put(
 
 const adjustStockRoute = asyncHandler(async (req, res) => {
   const key = requireIdempotencyKey(req);
-  const fingerprint = requestFingerprint("product:stock-adjustment", { productId: req.params.id }, req.body);
+  const identity = resourceIdempotency({ resourceId: req.params.id, operation: "stock-adjustment", fingerprintOperation: "product:stock-adjustment", parameter: "productId", body: req.body });
   const result = await executeIdempotently({
     ownerId: req.user._id,
-    operation: `stock-adjustment:${req.params.id}`,
+    ...identity,
     key,
-    fingerprint,
     work: async (session) => {
       const { product, adjustment } = await adjustStock({
         Product, StockBatch, StockAdjustment, ownerId: req.user._id,
-        productId: req.params.id, batchId: req.body.batchId || null,
+        productId: identity.resourceId, batchId: req.body.batchId || null,
         delta: req.body.delta, reason: req.body.reason, session,
       });
       return { resultType: "stock-adjustment", resultId: adjustment._id, value: { product, adjustment } };
     },
     replay: async (record) => {
-      const adjustment = await StockAdjustment.findOne({ _id: record.resultId, owner: req.user._id, product: req.params.id });
-      const product = await Product.findOne({ _id: req.params.id, owner: req.user._id });
+      const adjustment = await StockAdjustment.findOne({ _id: record.resultId, owner: req.user._id, product: identity.resourceId });
+      const product = await Product.findOne({ _id: identity.resourceId, owner: req.user._id });
       if (!adjustment || !product) throw new Error("Idempotent adjustment references missing resources");
       return { product, adjustment };
     },
@@ -338,11 +325,9 @@ router.post(
       if (p.costPrice == null || p.costPrice === "") {
         doc.costPrice = null;
       } else {
-        const cost = Number(p.costPrice);
-        if (!Number.isFinite(cost) || cost < 0) continue;
-        doc.costPrice = cost;
+        doc.costPrice = validateCurrency(p.costPrice, "costPrice");
       }
-      doc.stock = p.stock || 0;
+      doc.stock = validateNewQuantity(p.stock ?? 0, { allowZero: true });
       docs.push(doc);
     }
     if (docs.length === 0) {

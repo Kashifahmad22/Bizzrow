@@ -16,6 +16,15 @@ test("profit falls back to costMap for legacy items", () => {
   assert.equal(r.profit, 300);
 });
 
+test("zero-cost snapshots remain zero while missing historical snapshots use current cost", () => {
+  const Sale = require("../models/Sale");
+  const sale = Sale.hydrate({ total: 200, items: [
+    { product: "abcdefabcdefabcdefabcdef", name: "free", quantity: 1, unitPrice: 100, subtotal: 100, costPrice: 0 },
+    { product: "fedcbafedcbafedcbafedcba", name: "legacy", quantity: 1, unitPrice: 100, subtotal: 100 },
+  ] });
+  assert.equal(saleProfit(sale, { abcdefabcdefabcdefabcdef: 40, fedcbafedcbafedcbafedcba: 30 }).cogs, 30);
+});
+
 test("returns reduce both revenue and COGS", () => {
   const sale = { total: 1000, returnedAmount: 500, items: [{ quantity: 2, returnedQty: 1, costPrice: 300, product: "p1" }] };
   const r = saleProfit(sale);

@@ -15,7 +15,7 @@ const returnItemSchema = new mongoose.Schema(
   {
     product: { type: mongoose.Schema.Types.ObjectId, ref: "Product" },
     name: { type: String, default: "" }, // snapshot
-    quantity: { type: Number, required: true, min: 1 },
+    quantity: { type: Number, required: true, min: 0 },
     unitNet: { type: Number, default: 0 }, // net unit price refunded
     refund: { type: Number, default: 0 }, // quantity * unitNet
   },
@@ -30,6 +30,11 @@ const returnRecordSchema = new mongoose.Schema(
     invoiceNumber: { type: String, default: "" }, // snapshot of the original invoice
     type: { type: String, enum: ["return", "replacement"], default: "return" },
     items: { type: [returnItemSchema], default: [] },
+    quantityReconciliations: [{
+      product: { type: mongoose.Schema.Types.ObjectId, ref: "Product", required: true },
+      storedReturnedQty: { type: Number, required: true },
+      verifiedReturnedQty: { type: Number, required: true },
+    }],
     refundAmount: { type: Number, default: 0 }, // value of returned goods
     cashRefund: { type: Number, default: 0, min: 0 },
     cashRefundFromCredit: { type: Number, default: 0, min: 0 },

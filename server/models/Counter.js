@@ -13,6 +13,7 @@ const counterSchema = new mongoose.Schema(
     resultType: { type: String, default: "" },
     resultId: { type: mongoose.Schema.Types.ObjectId, default: null },
     relatedResourceId: { type: mongoose.Schema.Types.ObjectId, default: null },
+    responseSnapshot: { type: mongoose.Schema.Types.Mixed, default: undefined },
   },
   { versionKey: false }
 );

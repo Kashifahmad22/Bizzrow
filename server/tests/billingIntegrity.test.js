@@ -161,3 +161,17 @@ test("payment splits accept retail and wholesale amounts but reject overpayment"
     /positive/
   );
 });
+
+test("replacement payment splits reject fractions of paise and accept exact paise", () => {
+  assert.throws(() => normalizePaymentSplits([{ method: "cash", amount: 1.005 }], 10), /two decimal places/);
+  assert.deepEqual(normalizePaymentSplits([{ method: "cash", amount: "1.00" }], 10), [{ method: "cash", amount: 1 }]);
+});
+
+test("fractional sale totals use decimal half-up and return allocations agree", () => {
+  const { computeSaleTotals, allocateReturnItems } = require("../utils/saleMath");
+  for (const [quantity, expected] of [[1.005, 1.01], [2.675, 2.68], [1.015, 1.02]]) {
+    assert.equal(computeSaleTotals({ items: [{ unitPrice: 1, quantity }] }).total, expected);
+  }
+  const sale = { total: 1, items: [{ product: "p", quantity: 1, unitPrice: 1, subtotal: 1 }] };
+  assert.equal(allocateReturnItems(sale, [{ productId: "p", quantity: 0.145 }])[0].refund, 0.15);
+});

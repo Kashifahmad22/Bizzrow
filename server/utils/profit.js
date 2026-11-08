@@ -15,7 +15,7 @@ function round2(n) {
 }
 
 function unitCostFor(item, costMap = {}) {
-  if (item.costPrice && item.costPrice > 0) return item.costPrice;
+  if (item.costPrice != null) return Number(item.costPrice) || 0;
   const id = item.product ? String(item.product) : "";
   return costMap[id] || 0;
 }
