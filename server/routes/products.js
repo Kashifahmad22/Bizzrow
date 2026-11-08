@@ -80,7 +80,12 @@ router.get(
   "/",
   asyncHandler(async (req, res) => {
     const { q, status, maxQty, sort } = req.query;
-    const filter = { owner: req.user._id, ...buildTextFilter(q, ["name", "sku", "barcode", "category", "brand", "color", "size"]) };
+    const filter = {
+      owner: req.user._id,
+      ...buildTextFilter(q, ["name", "sku", "barcode", "category", "brand", "color", "size"], {
+        separatorInsensitive: true,
+      }),
+    };
     if (status === "out") filter.stock = 0;
     else if (status === "low") filter.stock = { $gt: 0, $lte: 10 };
     else if (status === "fast") filter.soldCount = { $gte: 5 };

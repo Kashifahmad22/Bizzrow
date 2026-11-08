@@ -79,6 +79,14 @@ test("product search API preserves literal matching, tenant scope, and paginatio
   const ownerId = new mongoose.Types.ObjectId();
   const otherOwnerId = new mongoose.Types.ObjectId();
   const fixtures = [
+    product({ id: "lhs-20", owner: ownerId, name: "LHS 20" }),
+    product({ id: "lhs-200", owner: ownerId, name: "LHS 200" }),
+    product({ id: "lhs-premium", owner: ownerId, name: "LHS 2 Premium" }),
+    product({ id: "lhs-hyphen", owner: ownerId, name: "LHS-20" }),
+    product({ id: "lhs-nbsp", owner: ownerId, name: "LHS\u00a020" }),
+    product({ id: "lhs-line-separator", owner: ownerId, name: "LHS\u202820" }),
+    product({ id: "lhs-paragraph-separator", owner: ownerId, name: "LHS\u202920" }),
+    product({ id: "unrelated-prefix", owner: ownerId, name: "LTX 20" }),
     product({ id: "spaced-name", owner: ownerId, name: "Product ABC 123" }),
     product({ id: "joined-name", owner: ownerId, name: "Product ABC123" }),
     product({ id: "sku", owner: ownerId, name: "SKU Product", sku: "SKU-ABC 123" }),
@@ -128,28 +136,85 @@ test("product search API preserves literal matching, tenant scope, and paginatio
   }
 
   try {
+    const lhs = await search({ q: "LHS" });
+    assert.ok(lhs.products.some((entry) => entry._id === "lhs-20"));
+
+    const lhsTwo = await search({ q: "LHS 2" });
+    assert.deepEqual(lhsTwo.products.map((entry) => entry._id).sort(), [
+      "lhs-20",
+      "lhs-200",
+      "lhs-hyphen",
+      "lhs-line-separator",
+      "lhs-nbsp",
+      "lhs-paragraph-separator",
+      "lhs-premium",
+    ]);
+
+    const lhsFull = await search({ q: "LHS 20" });
+    assert.ok(lhsFull.products.some((entry) => entry._id === "lhs-20"));
+
+    const lhsJoined = await search({ q: "LHS2" });
+    assert.ok(lhsJoined.products.some((entry) => entry._id === "lhs-20"));
+
     const spaced = await search({ q: "ABC 123" });
     assert.deepEqual(spaced.products.map((entry) => entry._id).sort(), [
       "barcode",
+      "double-space",
+      "joined-name",
       "sku",
       "spaced-name",
+      "unicode-space",
     ]);
 
     const trimmed = await search({ q: "\u00a0aBc 123\t" });
     assert.deepEqual(trimmed.products.map((entry) => entry._id).sort(), [
       "barcode",
+      "double-space",
+      "joined-name",
       "sku",
       "spaced-name",
+      "unicode-space",
     ]);
 
     const joined = await search({ q: "ABC123" });
-    assert.deepEqual(joined.products.map((entry) => entry._id), ["joined-name"]);
+    assert.deepEqual(joined.products.map((entry) => entry._id).sort(), [
+      "barcode",
+      "double-space",
+      "joined-name",
+      "sku",
+      "spaced-name",
+      "unicode-space",
+    ]);
 
     const repeatedSpace = await search({ q: "ABC  123" });
-    assert.deepEqual(repeatedSpace.products.map((entry) => entry._id), ["double-space"]);
+    assert.deepEqual(repeatedSpace.products.map((entry) => entry._id).sort(), [
+      "barcode",
+      "double-space",
+      "joined-name",
+      "sku",
+      "spaced-name",
+      "unicode-space",
+    ]);
 
     const unicodeSpace = await search({ q: "ABC\u00a0123" });
-    assert.deepEqual(unicodeSpace.products.map((entry) => entry._id), ["unicode-space"]);
+    assert.deepEqual(unicodeSpace.products.map((entry) => entry._id).sort(), [
+      "barcode",
+      "double-space",
+      "joined-name",
+      "sku",
+      "spaced-name",
+      "unicode-space",
+    ]);
+
+    const partialNumeric = await search({ q: "ABC 12" });
+    assert.deepEqual(partialNumeric.products.map((entry) => entry._id).sort(), [
+      "barcode",
+      "double-space",
+      "joined-name",
+      "sku",
+      "spaced-name",
+      "unicode-space",
+    ]);
 
     const secondPage = await search({ q: "Needle", limit: "50", page: "2" });
     assert.equal(secondPage.total, 75);
@@ -167,9 +232,55 @@ test("product search API preserves literal matching, tenant scope, and paginatio
   }
 });
 
-test("search trims outer whitespace but keeps internal whitespace literal", () => {
-  const spaced = buildTextFilter("  ABC 123  ", ["name"]);
+test("product search trims outer whitespace and tolerates internal separator differences", () => {
+  const spaced = buildTextFilter("  ABC 123  ", ["name"], { separatorInsensitive: true });
   const expression = spaced.$or[0].name;
   assert.equal(expression.test("Product ABC 123"), true);
-  assert.equal(expression.test("Product ABC  123"), false);
+  assert.equal(expression.test("Product ABC  123"), true);
+  assert.equal(expression.test("Product ABC123"), true);
+  assert.equal(expression.test("Product ABC-123"), true);
+  assert.equal(expression.test("Product ABC\u00a0123"), true);
+  assert.equal(expression.test("Product unrelated"), false);
+});
+
+test("other text searches retain literal internal whitespace matching", () => {
+  const expression = buildTextFilter("ABC 123", ["name"]).$or[0].name;
+  assert.equal(expression.test("Product ABC 123"), true);
+  assert.equal(expression.test("Product ABC123"), false);
+});
+
+test("serialized product search patterns preserve Unicode separators without PCRE-incompatible escapes", () => {
+  for (const query of ["LHS", "LHS 2", "LHS-2", "LHS  2", "LHS\u00a02", "LHS\u20032"]) {
+    const filter = buildTextFilter(query, ["name", "sku", "barcode"], { separatorInsensitive: true });
+    const serialized = mongoose.mongo.BSON.serialize(filter);
+    const decoded = mongoose.mongo.BSON.deserialize(serialized, { bsonRegExp: true });
+    for (const clause of decoded.$or) {
+      const regex = Object.values(clause)[0];
+      assert.equal(regex.options, "i");
+      assert.doesNotMatch(regex.pattern, /(?<!\\)(?:\\\\)*\\u[0-9a-f]{4}/i);
+    }
+    const expression = filter.$or[0].name;
+    for (const separator of [" ", "-", "  ", "\u00a0", "\u2003", "\u2028", "\u2029"]) {
+      assert.equal(expression.test(`LHS${separator}20`), true, `${JSON.stringify(query)}: ${JSON.stringify(separator)}`);
+    }
+    assert.equal(expression.test("LTX 20"), false);
+    if (query !== "LHS") {
+      assert.equal(expression.test("LHS\u202720"), false);
+      assert.equal(expression.test("LHS\u202a20"), false);
+    }
+  }
+});
+
+test("product search escapes regex metacharacters and leaves empty queries unfiltered", () => {
+  const query = "A.+(B)[C]{2}?^$|\\";
+  const expression = buildTextFilter(query, ["name"], { separatorInsensitive: true }).$or[0].name;
+  assert.equal(expression.test(`Prefix ${query} suffix`), true);
+  assert.equal(expression.test("AxyzBCCC"), false);
+  const backslashQuery = "LHS\\u2028";
+  const backslashFilter = buildTextFilter(backslashQuery, ["name"], { separatorInsensitive: true });
+  const decoded = mongoose.mongo.BSON.deserialize(mongoose.mongo.BSON.serialize(backslashFilter), { bsonRegExp: true });
+  assert.equal(backslashFilter.$or[0].name.test(backslashQuery), true);
+  assert.doesNotMatch(decoded.$or[0].name.pattern, /(?<!\\)(?:\\\\)*\\u[0-9a-f]{4}/i);
+  assert.deepEqual(buildTextFilter("", ["name"], { separatorInsensitive: true }), {});
+  assert.deepEqual(buildTextFilter(" \t\u00a0\u2028", ["name"], { separatorInsensitive: true }), {});
 });
