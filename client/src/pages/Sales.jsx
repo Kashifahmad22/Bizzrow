@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, useCallback } from "react";
+import { useEffect, useMemo, useState, useCallback, useRef } from "react";
 import { motion } from "framer-motion";
 import toast from "react-hot-toast";
 import { useDebounce } from "../hooks/useDebounce.js";
@@ -22,6 +22,7 @@ import {
 import { api } from "../api/client.js";
 import { formatINR, formatDate, relativeTime } from "../lib/format.js";
 import { buildInvoicePrintHtml } from "../lib/invoicePrint.js";
+import { createLatestRequest } from "../lib/latestRequest.js";
 import PageHeader from "../components/PageHeader.jsx";
 import BusinessLogo from "../components/BusinessLogo.jsx";
 import Modal from "../components/Modal.jsx";
@@ -389,7 +390,11 @@ function NewSaleModal({ onClose, onCreated }) {
   const [step, setStep] = useState(1); // 1: customer, 2: items, 3: payment
   const [customers, setCustomers] = useState([]);
   const [products, setProducts] = useState([]);
+  const [productPage, setProductPage] = useState(1);
+  const [hasMoreProducts, setHasMoreProducts] = useState(false);
+  const [loadingMoreProducts, setLoadingMoreProducts] = useState(false);
   const [loadingData, setLoadingData] = useState(true);
+  const productRequests = useRef(createLatestRequest());
 
   const [customerType, setCustomerType] = useState("existing");
   const [customer, setCustomer] = useState(null); // existing
@@ -421,17 +426,42 @@ function NewSaleModal({ onClose, onCreated }) {
 
   // Product search (Feature 3) — debounced, server-backed; only in-stock items are sellable.
   useEffect(() => {
+    const request = productRequests.current.start();
+    setLoadingMoreProducts(false);
     (async () => {
       try {
-        const params = { limit: 50 };
+        const params = { limit: 50, page: 1 };
         if (debouncedPq.trim()) params.q = debouncedPq.trim();
-        const { data } = await api.get("/products", { params });
+        const { data } = await api.get("/products", { params, signal: request.signal });
+        if (!request.isCurrent()) return;
         setProducts(data.products.filter((x) => x.stock > 0));
+        setProductPage(data.page || 1);
+        setHasMoreProducts((data.page || 1) < (data.pages || 1));
       } catch (err) {
-        toast.error(err.message);
+        if (request.isCurrent()) toast.error(err.message);
       }
     })();
+    return () => productRequests.current.cancel();
   }, [debouncedPq]);
+
+  const loadMoreProducts = async () => {
+    const request = productRequests.current.start();
+    const nextPage = productPage + 1;
+    setLoadingMoreProducts(true);
+    try {
+      const params = { limit: 50, page: nextPage };
+      if (debouncedPq.trim()) params.q = debouncedPq.trim();
+      const { data } = await api.get("/products", { params, signal: request.signal });
+      if (!request.isCurrent()) return;
+      setProducts((prev) => [...prev, ...data.products.filter((product) => product.stock > 0)]);
+      setProductPage(data.page || nextPage);
+      setHasMoreProducts((data.page || nextPage) < (data.pages || 1));
+    } catch (err) {
+      if (request.isCurrent()) toast.error(err.message);
+    } finally {
+      if (request.isCurrent()) setLoadingMoreProducts(false);
+    }
+  };
 
   const [billDisc, setBillDisc] = useState({ type: "amount", value: "" });
 
@@ -762,7 +792,11 @@ function NewSaleModal({ onClose, onCreated }) {
               <div>
                 <div className="card !p-3 mb-3 flex items-center gap-3">
                   <Search className="w-4 h-4 text-ink-400" />
-                  <input className="flex-1 outline-none bg-transparent text-sm" placeholder="Search name or SKU…" value={pq} onChange={(e) => setPq(e.target.value)} />
+                  <input className="flex-1 outline-none bg-transparent text-sm" placeholder="Search name or SKU…" value={pq} onChange={(e) => {
+                    productRequests.current.cancel();
+                    setLoadingMoreProducts(false);
+                    setPq(e.target.value);
+                  }} />
                 </div>
                 <div className="space-y-1 max-h-[28rem] overflow-y-auto">
                   {products.length === 0 && <p className="text-sm text-ink-500 text-center py-6">No in-stock products match.</p>}
@@ -785,6 +819,16 @@ function NewSaleModal({ onClose, onCreated }) {
                     </button>
                   ))}
                 </div>
+                {hasMoreProducts && pq.trim() === debouncedPq.trim() && (
+                  <button
+                    type="button"
+                    className="btn-outline w-full mt-2"
+                    disabled={loadingMoreProducts}
+                    onClick={loadMoreProducts}
+                  >
+                    {loadingMoreProducts ? "Loading…" : "Load more products"}
+                  </button>
+                )}
               </div>
               <div>
                 <h4 className="text-xs font-semibold uppercase tracking-wider text-ink-500 mb-2">Cart ({items.length})</h4>
@@ -1246,8 +1290,12 @@ function ReplacementModal({ saleId, items, saleTotal, saleType = "wholesale", on
   const [cart, setCart] = useState([]);
   const [pq, setPq] = useState("");
   const [products, setProducts] = useState([]);
+  const [productPage, setProductPage] = useState(1);
+  const [hasMoreProducts, setHasMoreProducts] = useState(false);
+  const [loadingMoreProducts, setLoadingMoreProducts] = useState(false);
   const [pay, setPay] = useState("");
   const dq = useDebounce(pq, 250);
+  const productRequests = useRef(createLatestRequest());
 
   const close = () => {
     if (financialMutation.submitting || financialMutation.pending) {
@@ -1262,17 +1310,42 @@ function ReplacementModal({ saleId, items, saleTotal, saleType = "wholesale", on
     .filter((it) => it.returnable > 0);
 
   useEffect(() => {
+    const request = productRequests.current.start();
+    setLoadingMoreProducts(false);
     (async () => {
       try {
-        const params = { limit: 30 };
+        const params = { limit: 30, page: 1 };
         if (dq.trim()) params.q = dq.trim();
-        const { data } = await api.get("/products", { params });
+        const { data } = await api.get("/products", { params, signal: request.signal });
+        if (!request.isCurrent()) return;
         setProducts(data.products.filter((p) => p.stock > 0));
+        setProductPage(data.page || 1);
+        setHasMoreProducts((data.page || 1) < (data.pages || 1));
       } catch (err) {
-        toast.error(err.message);
+        if (request.isCurrent()) toast.error(err.message);
       }
     })();
+    return () => productRequests.current.cancel();
   }, [dq]);
+
+  const loadMoreProducts = async () => {
+    const request = productRequests.current.start();
+    const nextPage = productPage + 1;
+    setLoadingMoreProducts(true);
+    try {
+      const params = { limit: 30, page: nextPage };
+      if (dq.trim()) params.q = dq.trim();
+      const { data } = await api.get("/products", { params, signal: request.signal });
+      if (!request.isCurrent()) return;
+      setProducts((prev) => [...prev, ...data.products.filter((product) => product.stock > 0)]);
+      setProductPage(data.page || nextPage);
+      setHasMoreProducts((data.page || nextPage) < (data.pages || 1));
+    } catch (err) {
+      if (request.isCurrent()) toast.error(err.message);
+    } finally {
+      if (request.isCurrent()) setLoadingMoreProducts(false);
+    }
+  };
 
   const refund = estimateReturnRefund(
     items || [],
@@ -1362,7 +1435,11 @@ function ReplacementModal({ saleId, items, saleTotal, saleType = "wholesale", on
           <h4 className="text-xs font-semibold uppercase tracking-wider text-ink-500 mb-2">Replacement items</h4>
           <div className="card !p-2.5 mb-2 flex items-center gap-2">
             <Search className="w-4 h-4 text-ink-400" />
-            <input className="flex-1 outline-none bg-transparent text-sm" placeholder="Search products…" value={pq} onChange={(e) => setPq(e.target.value)} />
+            <input className="flex-1 outline-none bg-transparent text-sm" placeholder="Search products…" value={pq} onChange={(e) => {
+              productRequests.current.cancel();
+              setLoadingMoreProducts(false);
+              setPq(e.target.value);
+            }} />
           </div>
           <div className="space-y-1 max-h-32 overflow-y-auto mb-2">
             {products.map((p) => (
@@ -1372,6 +1449,16 @@ function ReplacementModal({ saleId, items, saleTotal, saleType = "wholesale", on
               </button>
             ))}
           </div>
+          {hasMoreProducts && pq.trim() === dq.trim() && (
+            <button
+              type="button"
+              className="btn-outline w-full mb-2"
+              disabled={loadingMoreProducts}
+              onClick={loadMoreProducts}
+            >
+              {loadingMoreProducts ? "Loading…" : "Load more products"}
+            </button>
+          )}
           {cart.map((c) => (
             <div key={c.productId} className="flex items-center gap-2 text-sm py-1">
               <span className="flex-1 truncate text-ink-800">{c.name}</span>

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import toast from "react-hot-toast";
 import { Plus, Search, Edit2, Trash2, Package, Image as ImageIcon, Sparkles, Upload, ScanLine, PencilLine, Check, X, Download, Copy } from "lucide-react";
@@ -7,6 +7,7 @@ import { useFinancialMutation } from "../hooks/useFinancialMutation.js";
 import { useDebounce } from "../hooks/useDebounce.js";
 import { duplicatePairKey, normalizeDuplicateGroups } from "../lib/duplicateReview.js";
 import { formatINR } from "../lib/format.js";
+import { createLatestRequest } from "../lib/latestRequest.js";
 import PageHeader from "../components/PageHeader.jsx";
 import Modal from "../components/Modal.jsx";
 import EmptyState from "../components/EmptyState.jsx";
@@ -53,10 +54,13 @@ export default function Products() {
   const [importing, setImporting] = useState(false);
   const [duplicateReview, setDuplicateReview] = useState(false);
   const [batchProduct, setBatchProduct] = useState(null);
+  const listRequests = useRef(createLatestRequest());
   const debouncedQ = useDebounce(q, 300);
   const debouncedQty = useDebounce(customQty, 400);
+  const listQuerySettled = q.trim() === debouncedQ.trim()
+    && (qtyFilter !== "custom" || customQty === debouncedQty);
 
-  const load = useCallback(async (p = 1, append = false) => {
+  const load = useCallback(async (p = 1, append = false, request = listRequests.current.start()) => {
     if (append) setLoadingMore(true);
     else setLoading(true);
     try {
@@ -65,21 +69,25 @@ export default function Products() {
       if (status !== "all") params.status = status;
       const maxQty = qtyFilter === "custom" ? Number(debouncedQty) : qtyFilter === "any" ? 0 : Number(qtyFilter);
       if (maxQty > 0) params.maxQty = maxQty;
-      const { data } = await api.get("/products", { params });
+      const { data } = await api.get("/products", { params, signal: request.signal });
+      if (!request.isCurrent()) return;
       setProducts((prev) => (append ? [...prev, ...data.products] : data.products));
       setTotal(data.total ?? data.products.length);
       setPage(data.page || 1);
       setHasMore((data.page || 1) < (data.pages || 1));
     } catch (err) {
-      toast.error(err.message);
+      if (request.isCurrent()) toast.error(err.message);
     } finally {
-      setLoading(false);
-      setLoadingMore(false);
+      if (request.isCurrent()) {
+        setLoading(false);
+        setLoadingMore(false);
+      }
     }
   }, [debouncedQ, status, qtyFilter, debouncedQty, sort]);
 
   useEffect(() => {
     load(1, false);
+    return () => listRequests.current.cancel();
   }, [load]);
 
   const onDelete = async (p) => {
@@ -140,7 +148,10 @@ export default function Products() {
           className="flex-1 outline-none bg-transparent text-sm placeholder:text-ink-300"
           placeholder="Search by name, SKU, barcode, brand, color, size…"
           value={q}
-          onChange={(e) => setQ(e.target.value)}
+          onChange={(e) => {
+            listRequests.current.cancel();
+            setQ(e.target.value);
+          }}
         />
       </div>
 
@@ -230,7 +241,7 @@ export default function Products() {
               ))}
             </AnimatePresence>
           </div>
-          {hasMore && (
+          {hasMore && listQuerySettled && (
             <div className="text-center mt-4">
               <button onClick={() => load(page + 1, true)} disabled={loadingMore} className="btn-outline">
                 {loadingMore ? "Loading…" : "Load more"}
