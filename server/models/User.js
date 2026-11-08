@@ -13,6 +13,13 @@ const userSchema = new mongoose.Schema(
       gstNumber: { type: String, default: "" },
       phone: { type: String, default: "" },
       address: { type: String, default: "" },
+      bankDetails: {
+        bankName: { type: String, default: "" },
+        accountHolderName: { type: String, default: "" },
+        accountNumber: { type: String, default: "" },
+        ifscCode: { type: String, default: "" },
+        branchName: { type: String, default: "" },
+      },
       upiId: { type: String, default: "" }, // e.g. shop@okhdfcbank
       upiQr: { type: String, default: "" }, // base64 data URL
       currency: { type: String, default: "INR" },

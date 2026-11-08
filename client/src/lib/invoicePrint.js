@@ -31,14 +31,12 @@ function invoiceRows(invoice) {
   } else if (Number(invoice.totalDiscount) > 0 && !Number(invoice.itemDiscountTotal)) {
     rows.push(["Discount", `- ${amount(invoice.totalDiscount)}`, "positive"]);
   }
-  for (const tax of Array.isArray(invoice.taxBreakdown) ? invoice.taxBreakdown : []) {
-    rows.push([tax.label || tax.name || "Tax", amount(tax.amount ?? tax.taxAmount), ""]);
-  }
-  if (!Array.isArray(invoice.taxBreakdown) || invoice.taxBreakdown.length === 0) {
-    for (const [index, item] of (invoice.items || []).entries()) {
-      if (Number(item.taxAmount)) rows.push([`Tax - item ${index + 1}`, amount(item.taxAmount), ""]);
-    }
-  }
+  rows.push(["TAX SUMMARY", "", "tax-header"]);
+  rows.push(["Taxable amount", "Not recorded", "tax"]);
+  rows.push(["CGST", "—", "tax"]);
+  rows.push(["SGST", "—", "tax"]);
+  rows.push(["IGST", "—", "tax"]);
+  rows.push(["Total tax", "Not recorded", "tax-total"]);
   rows.push(["Grand total", amount(invoice.total), "grand"]);
   for (const payment of invoice.payments || []) {
     const label = PAYMENT_LABELS[payment.method] || payment.method;
@@ -84,6 +82,15 @@ export function buildInvoicePrintHtml(invoice, format = "a4") {
   const logo = typeof business.logo === "string" && /^data:image\/(?:png|jpeg|jpg);base64,[A-Za-z\d+/=]+$/i.test(business.logo)
     ? `<img class="logo" src="${business.logo}" alt="">`
     : "";
+  const bankDetails = [
+    ["Bank name", business.bankDetails?.bankName],
+    ["Account holder", business.bankDetails?.accountHolderName],
+    ["Account number", business.bankDetails?.accountNumber],
+    ["IFSC", business.bankDetails?.ifscCode],
+    ["Branch", business.bankDetails?.branchName],
+  ].filter(([, value]) => typeof value === "string" && value.trim())
+    .map(([label, value]) => `<div><dt>${escapeHtml(label)}</dt><dd>${escapeHtml(value.trim())}</dd></div>`)
+    .join("");
   const contact = [business.address, business.phone, business.email, business.gstNumber && `GSTIN: ${business.gstNumber}`]
     .filter(Boolean)
     .map((entry) => `<div>${escapeHtml(entry)}</div>`)
@@ -109,7 +116,6 @@ export function buildInvoicePrintHtml(invoice, format = "a4") {
       <td>${escapeHtml(item.unit || "")}</td>
       <td class="numeric">${amount(item.unitPrice)}</td>
       <td class="numeric">${Number(item.discountAmount) ? amount(item.discountAmount) : "—"}</td>
-      <td class="numeric">${Number(item.taxAmount) ? amount(item.taxAmount) : "—"}</td>
       <td class="numeric">${amount(item.subtotal ?? Number(item.unitPrice || 0) * Number(item.quantity || 0))}</td>
     </tr>`;
   }).join("");
@@ -134,16 +140,11 @@ export function buildInvoicePrintHtml(invoice, format = "a4") {
 
   const itemContent = thermal
     ? `<section class="thermal-items">${itemRows || "<p>No item details recorded.</p>"}</section>`
-    : `<table><thead><tr><th>#</th><th>Item / product code</th><th class="numeric">Qty</th><th>Unit</th><th class="numeric">Rate</th><th class="numeric">Disc.</th><th class="numeric">Tax</th><th class="numeric">Line total</th></tr></thead><tbody>${itemRows}</tbody></table>`;
-  const taxNotRecorded = !(invoice.taxBreakdown?.length)
-    && !items.some((item) => Number(item.taxAmount))
-    ? '<p class="tax-note">Tax was not itemized in the saved sale.</p>'
-    : "";
-
+    : `<table><thead><tr><th>#</th><th>Item / product code</th><th class="numeric">Qty</th><th>Unit</th><th class="numeric">Rate</th><th class="numeric">Disc.</th><th class="numeric">Line total</th></tr></thead><tbody>${itemRows}</tbody></table>`;
   const style = thermal ? `
     @page { size: ${width} auto; margin: 3mm; }
     body { width: ${format === "thermal58" ? "52mm" : "74mm"}; margin: 0 auto; font: ${format === "thermal58" ? "10px" : "11px"} Arial, sans-serif; color: #202438; }
-    .brand { text-align: center; } .logo { max-width: 24mm; max-height: 15mm; object-fit: contain; display: block; margin: 0 auto 2mm; }
+    .brand { text-align: center; } .logo { width: 20mm; height: 20mm; object-fit: contain; object-position: center; display: block; margin: 0 auto 2mm; background: #fff; }
     h1 { font-size: 15px; margin: 0 0 2mm; overflow-wrap: anywhere; } .contact { color: #555; font-size: 9px; line-height: 1.35; }
     .doc-title { margin: 3mm 0 1mm; text-align: center; font-weight: bold; } .parties { display: block; margin: 2mm 0; }
     .parties h2 { display: none; } .sale-meta { border-top: 1px dashed #888; margin-top: 2mm; padding-top: 2mm; }
@@ -152,8 +153,8 @@ export function buildInvoicePrintHtml(invoice, format = "a4") {
     .thermal-row, .summary-row { display: flex; justify-content: space-between; gap: 2mm; margin: 1mm 0; }
     .thermal-row span, .summary-row span { overflow-wrap: anywhere; }
     .sub { color: #555; font-size: 9px; margin-top: 1mm; overflow-wrap: anywhere; }
-    .tax-note { font-size: 8px; color: #666; }
-    .summary { border-bottom: 1px dashed #888; padding: 2mm 0; } .grand { font-size: 1.08em; font-weight: bold; border-top: 1px dashed #888; padding-top: 1mm; }
+    .summary { border-bottom: 1px dashed #888; padding: 2mm 0; } .tax-header { border-top: 1px dashed #888; padding-top: 1mm; margin-top: 2mm; font-size: .9em; font-weight: bold; } .tax-total { font-weight: bold; } .grand { font-size: 1.08em; font-weight: bold; border-top: 1px dashed #888; padding-top: 1mm; }
+    .bank-details { border-top: 1px dashed #888; padding-top: 2mm; margin-top: 2mm; } .bank-details h2 { font-size: 10px; text-transform: uppercase; } .bank-details dl { margin: 0; } .bank-details dl > div { display: flex; gap: 2mm; margin: 1mm 0; overflow-wrap: anywhere; } .bank-details dt { font-weight: bold; } .bank-details dd { margin: 0; overflow-wrap: anywhere; }
     .positive { color: #176f40; } .due { font-weight: bold; color: #a22; }
     .terms { font-size: 9px; } .terms h2 { font-size: 10px; text-transform: uppercase; }
     .terms ol { padding-left: 4mm; margin: 1mm 0; } .terms li { margin: 1mm 0; overflow-wrap: anywhere; }
@@ -161,7 +162,7 @@ export function buildInvoicePrintHtml(invoice, format = "a4") {
   ` : `
     @page { size: A4; margin: 14mm; }
     body { margin: 0; font: 10pt Arial, sans-serif; color: #202438; } .brand { display: flex; gap: 12px; align-items: flex-start; }
-    .logo { max-width: 18mm; max-height: 18mm; object-fit: contain; } h1 { font-size: 22pt; margin: 0 0 3mm; }
+    .logo { width: 25mm; height: 25mm; object-fit: contain; object-position: center; background: #fff; flex: 0 0 auto; } h1 { font-size: 22pt; margin: 0 0 3mm; }
     .contact { color: #596176; font-size: 9pt; line-height: 1.4; overflow-wrap: anywhere; }
     .doc-title { margin-left: auto; font-size: 18pt; font-weight: bold; color: #3849f5; text-align: right; }
     .parties { display: flex; justify-content: space-between; gap: 15mm; border-top: 1px solid #dfe3ed; border-bottom: 1px solid #dfe3ed; margin: 8mm 0 5mm; padding: 4mm 0; }
@@ -169,9 +170,10 @@ export function buildInvoicePrintHtml(invoice, format = "a4") {
     .sale-meta { text-align: right; } table { width: 100%; border-collapse: collapse; font-size: 8pt; table-layout: fixed; }
     th { background: #f4f6fb; font-size: 7pt; text-align: left; } th, td { padding: 2.3mm 1.2mm; border-bottom: 1px solid #e6e8f0; vertical-align: top; overflow-wrap: anywhere; }
     .numeric { text-align: right; }     .sub { color: #687087; font-size: 7pt; margin-top: 1mm; }
-    .tax-note { color: #687087; font-size: 7pt; margin: 2mm 0 0; }
     .summary { width: min(100%, 90mm); margin: 5mm 0 0 auto; } .summary-row { display: flex; justify-content: space-between; gap: 5mm; padding: 1.2mm 0; }
     .summary-row strong { text-align: right; white-space: nowrap; } .grand { font-size: 11pt; font-weight: bold; border-top: 1px solid #687087; margin-top: 1mm; padding-top: 2mm; }
+    .tax-header { border-top: 1px solid #dfe3ed; padding-top: 2mm; margin-top: 2mm; color: #687087; font-size: 7pt; font-weight: bold; letter-spacing: .04em; } .tax-total { font-weight: bold; }
+    .bank-details { margin: 6mm 0 0; padding: 4mm; border: 1px solid #dfe3ed; border-radius: 2mm; break-inside: avoid; } .bank-details h2 { margin: 0 0 3mm; } .bank-details dl { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 3mm 6mm; margin: 0; } .bank-details dl > div { min-width: 0; overflow-wrap: anywhere; } .bank-details dt { color: #687087; font-size: 7pt; text-transform: uppercase; } .bank-details dd { margin: 1mm 0 0; font-size: 8pt; overflow-wrap: anywhere; }
     .positive { color: #176f40; } .due { font-weight: bold; color: #a22; }
     .terms { margin-top: 7mm; font-size: 8pt; } .terms h2 { font-size: 8pt; } .terms li { margin: 1.5mm 0; break-inside: avoid; }
     footer { margin-top: 10mm; display: flex; justify-content: space-between; color: #687087; font-size: 8pt; }
@@ -181,7 +183,7 @@ export function buildInvoicePrintHtml(invoice, format = "a4") {
   return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Invoice ${escapeHtml(invoice.invoiceNumber || "")}</title><style>*{box-sizing:border-box} ${style}</style></head>
     <body><header class="brand">${logo}<div><h1>${escapeHtml(business.name || "Bizzrow")}</h1><div class="contact">${contact}</div></div>${thermal ? "" : '<div class="doc-title">INVOICE</div>'}</header>
     ${thermal ? '<div class="doc-title">INVOICE</div>' : ""}
-    ${details}${itemContent}${taxNotRecorded}<section class="summary">${summaryRows}</section>${termsHtml}
+    ${details}${itemContent}<section class="summary">${summaryRows}</section>${bankDetails ? `<section class="bank-details"><h2>Bank details</h2><dl>${bankDetails}</dl></section>` : ""}${termsHtml}
     <footer><span>Thank you for your business.</span>${business.phone ? `<span>${escapeHtml(business.phone)}</span>` : ""}</footer>
     <script>window.addEventListener("load",()=>setTimeout(()=>window.print(),300));</script></body></html>`;
 }

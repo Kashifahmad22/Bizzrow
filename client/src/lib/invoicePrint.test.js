@@ -51,6 +51,62 @@ test("thermal browser layouts use dedicated narrow widths", () => {
   assert.match(buildInvoicePrintHtml(invoice, "thermal58"), /size: 58mm auto/);
 });
 
+test("A4 and thermal print invoices show optional bank details and tax placeholders", () => {
+  for (const format of ["a4", "thermal80", "thermal58"]) {
+    const html = buildInvoicePrintHtml({
+      ...invoice,
+      business: {
+        ...invoice.business,
+        bankDetails: {
+          bankName: "Example Bank",
+          accountHolderName: "Example Holder",
+          accountNumber: "001234",
+          ifscCode: "EXAM0001234",
+          branchName: "Main Branch",
+        },
+      },
+      items: [{ ...invoice.items[0], taxAmount: 12, taxRate: 6 }],
+      taxBreakdown: [{ label: "CGST", amount: 6 }, { label: "SGST", amount: 6 }],
+    }, format);
+    assert.match(html, /Bank details/);
+    for (const value of ["Example Bank", "Example Holder", "001234", "EXAM0001234", "Main Branch"]) {
+      assert.ok(html.includes(value), `${format}: missing ${value}`);
+    }
+    assert.match(html, /Taxable amount/);
+    assert.match(html, /CGST/);
+    assert.match(html, /SGST/);
+    assert.match(html, /IGST/);
+    assert.match(html, /Total tax/);
+    assert.ok(html.indexOf("TAX SUMMARY") < html.indexOf("Grand total"));
+    assert.doesNotMatch(html, /<th[^>]*>Tax<\/th>/);
+    assert.doesNotMatch(html, /Tax - item/);
+    assert.match(html, /Rs\. 85\.00/);
+  }
+});
+
+test("browser print hides empty bank details and contains logos in consistent frames", () => {
+  const missing = buildInvoicePrintHtml(invoice, "a4");
+  assert.doesNotMatch(missing, /Bank details/);
+  const partial = buildInvoicePrintHtml({
+    ...invoice,
+    business: { ...invoice.business, bankDetails: { bankName: "Partial Bank" } },
+  }, "thermal58");
+  assert.match(partial, /Partial Bank/);
+  assert.doesNotMatch(partial, /Account holder|Account number|IFSC|Branch/);
+
+  const logo = "data:image/png;base64,AAAA";
+  for (const format of ["a4", "thermal80", "thermal58"]) {
+    const html = buildInvoicePrintHtml({
+      ...invoice,
+      business: { ...invoice.business, logo },
+    }, format);
+    assert.match(html, /object-fit: contain/);
+    assert.match(html, /object-position: center/);
+    assert.match(html, /width: (20|25)mm; height: \1mm/);
+    assert.match(html, /background: #fff/);
+  }
+});
+
 test("unsupported print format fails explicitly", () => {
   assert.throws(() => buildInvoicePrintHtml(invoice, "receipt"), /Choose A4/);
 });

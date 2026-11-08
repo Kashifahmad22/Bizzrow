@@ -1,7 +1,45 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
+const zlib = require("node:zlib");
 const PDFDocument = require("pdfkit");
 const { buildInvoicePdfDocument, invoiceRows } = require("../services/invoicePdf");
+
+function crc32(buffer) {
+  let crc = 0xffffffff;
+  for (const byte of buffer) {
+    crc ^= byte;
+    for (let bit = 0; bit < 8; bit += 1) crc = (crc >>> 1) ^ ((crc & 1) ? 0xedb88320 : 0);
+  }
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
+function pngChunk(type, data) {
+  const name = Buffer.from(type);
+  const length = Buffer.alloc(4);
+  length.writeUInt32BE(data.length);
+  const checksum = Buffer.alloc(4);
+  checksum.writeUInt32BE(crc32(Buffer.concat([name, data])));
+  return Buffer.concat([length, name, data, checksum]);
+}
+
+function logoDataUrl(width, height) {
+  const header = Buffer.alloc(13);
+  header.writeUInt32BE(width, 0);
+  header.writeUInt32BE(height, 4);
+  header[8] = 8;
+  header[9] = 6;
+  const row = Buffer.alloc(width * 4 + 1);
+  row.fill(230, 1);
+  row.fill(255, 4);
+  const pixels = Buffer.concat(Array.from({ length: height }, () => row));
+  const png = Buffer.concat([
+    Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]),
+    pngChunk("IHDR", header),
+    pngChunk("IDAT", zlib.deflateSync(pixels)),
+    pngChunk("IEND", Buffer.alloc(0)),
+  ]);
+  return `data:image/png;base64,${png.toString("base64")}`;
+}
 
 function fixture(overrides = {}) {
   return {
@@ -105,11 +143,20 @@ test("thermal rows reserve space for wrapped labels and amounts", async () => {
       const rows = invoiceRows(sale);
       let index = 0;
       for (let row = 0; row < rows.length; row++) {
+        if (rows[row][2] === "tax-header") {
+          index = calls.findIndex((call, i) => i >= index && call.text === rows[row][0]);
+          assert.notEqual(index, -1, `${format}: missing ${rows[row][0]}`);
+          const next = calls.slice(index + 1).find((call) => call.text === rows[row + 1][0]);
+          assert.ok(next, `${format}: missing tax summary values`);
+          assert.ok(next.start >= calls[index].end, `${format}: tax summary heading overlaps its values`);
+          index += 1;
+          continue;
+        }
         index = calls.findIndex((call, i) => i >= index && call.text === rows[row][0]);
         assert.notEqual(index, -1, `${format}: missing ${rows[row][0]}`);
         const label = calls[index];
         const value = calls[index + 1];
-        assert.equal(value.text, rows[row][1]);
+        assert.equal(value.text, rows[row][1].replace(/[–—]/g, "-"));
         assert.equal(label.start, value.start);
         const nextLabel = row + 1 < rows.length ? rows[row + 1][0] : "TERMS";
         const next = calls.slice(index + 2).find((call) => call.text === nextLabel);
@@ -127,10 +174,21 @@ test("thermal rows reserve space for wrapped labels and amounts", async () => {
   }
 });
 
-test("invoice rows use the saved totals and do not infer missing GST", () => {
+test("tax summary placeholders precede the saved grand total without changing it", () => {
   const rows = invoiceRows(fixture());
   assert.ok(rows.some((row) => row[0] === "Bill discount (10%)" && row[1] === "- Rs. 22.50"));
-  assert.equal(rows.some((row) => row[0].includes("Tax")), false);
+  const taxHeader = rows.findIndex((row) => row[0] === "TAX SUMMARY");
+  const total = rows.findIndex((row) => row[0] === "Grand total");
+  assert.ok(taxHeader >= 0 && taxHeader < total);
+  assert.deepEqual(rows.slice(taxHeader, total), [
+    ["TAX SUMMARY", "", "tax-header"],
+    ["Taxable amount", "Not recorded", "tax"],
+    ["CGST", "—", "tax"],
+    ["SGST", "—", "tax"],
+    ["IGST", "—", "tax"],
+    ["Total tax", "Not recorded", "tax-total"],
+  ]);
+  assert.equal(rows[total][1], "Rs. 202.50");
   assert.ok(rows.some((row) => row[0] === "Outstanding balance" && row[1] === "Rs. 52.50"));
 });
 
@@ -150,4 +208,103 @@ test("legacy zero-default subtotal falls back to saved sale total and recorded a
   assert.ok(rows.some((row) => row[0].startsWith("Return 1") && row[1] === "Rs. 100.00"));
   assert.ok(rows.some((row) => row[0] === "Return refund - UPI" && row[1] === "Rs. 100.00"));
   assert.ok(rows.some((row) => row[0] === "Net sale value after returns" && row[1] === "Rs. 1,000.00"));
+});
+
+test("PDF invoice formats fit square, landscape, and portrait logos without stretching", async () => {
+  const originalImage = PDFDocument.prototype.image;
+  const cases = [
+    { width: 40, height: 40, format: "a4", fit: [58, 52] },
+    { width: 80, height: 32, format: "thermal80", fit: [180.77, 28] },
+    { width: 32, height: 80, format: "thermal58", fit: [126.41, 24] },
+  ];
+  try {
+    for (const scenario of cases) {
+      let rendered;
+      PDFDocument.prototype.image = function (source, x, y, options) {
+        rendered = { source, x, y, options };
+        return originalImage.call(this, source, x, y, options);
+      };
+      const pdf = await buildInvoicePdfDocument(
+        fixture(),
+        { name: "Test Business", logo: logoDataUrl(scenario.width, scenario.height) },
+        {},
+        { format: scenario.format }
+      );
+      assert.equal(pdf.subarray(0, 5).toString(), "%PDF-");
+      assert.ok(rendered);
+      assert.deepEqual(rendered.options.fit, scenario.fit);
+      assert.equal(rendered.options.valign, "center");
+    }
+  } finally {
+    PDFDocument.prototype.image = originalImage;
+  }
+});
+
+test("bank details render completely, partially, or not at all across PDF formats", async () => {
+  const originalText = PDFDocument.prototype.text;
+  const capture = async (format, bankDetails) => {
+    const calls = [];
+    PDFDocument.prototype.text = function (text, ...args) {
+      calls.push(String(text));
+      return originalText.call(this, text, ...args);
+    };
+    try {
+      const pdf = await buildInvoicePdfDocument(
+        fixture(),
+        { name: "Test Business", bankDetails },
+        {},
+        { format }
+      );
+      assert.equal(pdf.subarray(0, 5).toString(), "%PDF-");
+      return calls.join("\n");
+    } finally {
+      PDFDocument.prototype.text = originalText;
+    }
+  };
+
+  try {
+    for (const format of ["a4", "thermal80", "thermal58"]) {
+      const complete = await capture(format, {
+        bankName: "Example Bank",
+        accountHolderName: "Example Holder",
+        accountNumber: "001234",
+        ifscCode: "EXAM0001234",
+        branchName: "Main Branch",
+      });
+      assert.match(complete, /BANK DETAILS/);
+      for (const value of ["Example Bank", "Example Holder", "001234", "EXAM0001234", "Main Branch"]) {
+        assert.ok(complete.includes(value), `${format}: missing ${value}`);
+      }
+
+      const partial = await capture(format, { bankName: "Partial Bank" });
+      assert.match(partial, /Partial Bank/);
+      assert.doesNotMatch(partial, /Account holder:|Account number:|IFSC:|Branch:/);
+
+      const missing = await capture(format, undefined);
+      assert.doesNotMatch(missing, /BANK DETAILS/);
+    }
+  } finally {
+    PDFDocument.prototype.text = originalText;
+  }
+});
+
+test("legacy item tax values are not shown in invoice lines and totals stay saved", async () => {
+  const sale = fixture({
+    items: [{ ...fixture().items[0], taxAmount: 12, taxRate: 6 }],
+    taxBreakdown: [{ label: "CGST", amount: 6 }, { label: "SGST", amount: 6 }],
+  });
+  const originalText = PDFDocument.prototype.text;
+  const renderedText = [];
+  PDFDocument.prototype.text = function (text, ...args) {
+    renderedText.push(String(text));
+    return originalText.call(this, text, ...args);
+  };
+  try {
+    await buildInvoicePdfDocument(sale, { name: "Test Business" });
+  } finally {
+    PDFDocument.prototype.text = originalText;
+  }
+  assert.equal(renderedText.some((text) => /Tax \(6%\)|item 1/.test(text)), false);
+  const rows = invoiceRows(sale);
+  assert.equal(rows.find((row) => row[0] === "Grand total")[1], "Rs. 202.50");
 });

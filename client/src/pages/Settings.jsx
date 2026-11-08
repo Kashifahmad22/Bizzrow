@@ -3,9 +3,9 @@ import toast from "react-hot-toast";
 import { Save, Image as ImageIcon, Building2, QrCode, Bell, Palette, Sun, Moon, Upload } from "lucide-react";
 import { api } from "../api/client.js";
 import PageHeader from "../components/PageHeader.jsx";
+import BusinessLogo from "../components/BusinessLogo.jsx";
 import { useAuth } from "../context/AuthContext.jsx";
 import { useTheme } from "../context/ThemeContext.jsx";
-import { initials } from "../lib/format.js";
 
 const DEFAULT_INVOICE_TERMS = [
   "Return or exchange requests may be considered within {returnPeriodDays} days of the invoice date, subject to the policy communicated at purchase and applicable law.",
@@ -64,6 +64,44 @@ export default function Settings() {
     reader.readAsDataURL(file);
   };
 
+  const readLogo = (file) => {
+    if (!file) return;
+    if (!["image/png", "image/jpeg"].includes(file.type)) {
+      toast.error("Business logos must be PNG or JPG images.");
+      return;
+    }
+    if (file.size > 1.5 * 1024 * 1024) {
+      toast.error("Image must be under 1.5 MB");
+      return;
+    }
+    const reader = new FileReader();
+    reader.onerror = () => toast.error("Could not read the selected logo.");
+    reader.onload = () => {
+      const image = new Image();
+      image.onerror = () => toast.error("The selected logo is not a valid image.");
+      image.onload = () => {
+        const scale = Math.min(1, 1200 / Math.max(image.naturalWidth, image.naturalHeight));
+        const canvas = document.createElement("canvas");
+        canvas.width = Math.max(1, Math.round(image.naturalWidth * scale));
+        canvas.height = Math.max(1, Math.round(image.naturalHeight * scale));
+        const context = canvas.getContext("2d");
+        if (!context) {
+          toast.error("Could not process the selected logo.");
+          return;
+        }
+        context.drawImage(image, 0, 0, canvas.width, canvas.height);
+        const normalized = canvas.toDataURL("image/png");
+        if (normalized.length > 2 * 1024 * 1024) {
+          toast.error("Processed logo must be under 1.5 MB.");
+          return;
+        }
+        setBusiness((current) => ({ ...current, logo: normalized }));
+      };
+      image.src = String(reader.result);
+    };
+    reader.readAsDataURL(file);
+  };
+
   return (
     <div>
       <PageHeader title="Settings" subtitle="Your business profile, appearance, and automations." />
@@ -77,13 +115,12 @@ export default function Settings() {
 
           {/* Logo */}
           <div className="flex items-center gap-4 mb-5">
-            <div className="w-20 h-20 rounded-2xl overflow-hidden shrink-0 border border-ink-200/60 bg-ink-50 flex items-center justify-center">
-              {business.logo ? (
-                <img src={business.logo} alt="Logo" className="w-full h-full object-cover" />
-              ) : (
-                <span className="font-display font-extrabold text-2xl text-brand-400">{initials(business.name || "SV")}</span>
-              )}
-            </div>
+            <BusinessLogo
+              logo={business.logo}
+              name={business.name || "Your Shop"}
+              className="w-20 h-20 rounded-2xl border border-ink-200/60"
+              fallbackClassName="font-display font-extrabold text-2xl text-brand-400"
+            />
             <div>
               <div className="text-sm font-semibold text-ink-800 mb-1">Business logo</div>
               <p className="text-xs text-ink-500 mb-2">Shown across the app as your primary identity.</p>
@@ -97,7 +134,40 @@ export default function Settings() {
                   </button>
                 )}
               </div>
-              <input ref={logoInputRef} type="file" accept="image/*" className="hidden" onChange={(e) => readImage(e.target.files?.[0], 1.5, (d) => setBusiness((b) => ({ ...b, logo: d })))} />
+              <input ref={logoInputRef} type="file" accept="image/png,image/jpeg" className="hidden" onChange={(e) => readLogo(e.target.files?.[0])} />
+            </div>
+          </div>
+
+          {/* Bank details */}
+          <div className="card">
+            <div className="mb-4">
+              <h2 className="font-display font-bold text-lg text-ink-900">Bank details</h2>
+              <p className="text-sm text-ink-500 mt-1">Optional details shown on invoices for this business.</p>
+            </div>
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+              {[
+                ["bankName", "Bank name", "e.g. State Bank of India", "organization"],
+                ["accountHolderName", "Account holder name", "Name on the account", "name"],
+                ["accountNumber", "Account number", "Enter account number", "off"],
+                ["ifscCode", "IFSC code", "e.g. SBIN0001234", "off"],
+                ["branchName", "Branch name", "e.g. Connaught Place", "organization"],
+              ].map(([field, label, placeholder, autoComplete]) => (
+                <div key={field}>
+                  <label className="label" htmlFor={`bank-${field}`}>{label}</label>
+                  <input
+                    id={`bank-${field}`}
+                    className="input"
+                    value={business.bankDetails?.[field] || ""}
+                    placeholder={placeholder}
+                    autoComplete={autoComplete}
+                    maxLength={field === "accountNumber" ? 34 : field === "ifscCode" ? 11 : 120}
+                    onChange={(event) => setBusiness((current) => ({
+                      ...current,
+                      bankDetails: { ...current.bankDetails, [field]: event.target.value },
+                    }))}
+                  />
+                </div>
+              ))}
             </div>
           </div>
 

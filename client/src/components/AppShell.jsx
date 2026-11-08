@@ -17,6 +17,7 @@ import { useState } from "react";
 import { useAuth } from "../context/AuthContext.jsx";
 import { useTheme } from "../context/ThemeContext.jsx";
 import { initials } from "../lib/format.js";
+import BusinessLogo from "./BusinessLogo.jsx";
 import clsx from "clsx";
 
 const NAV = [
@@ -121,17 +122,12 @@ function BrandIdentity({ business, compact }) {
   const name = business?.name || "Your Shop";
   return (
     <div className="flex items-center gap-3 min-w-0">
-      {business?.logo ? (
-        <img
-          src={business.logo}
-          alt={name}
-          className="w-10 h-10 rounded-xl object-cover border border-ink-200/60 shrink-0"
-        />
-      ) : (
-        <div className="w-10 h-10 rounded-xl bg-gradient-brand flex items-center justify-center shadow-glow shrink-0">
-          <span className="text-white font-extrabold text-sm">{initials(name)}</span>
-        </div>
-      )}
+      <BusinessLogo
+        logo={business?.logo}
+        name={name}
+        className="w-10 h-10 rounded-xl border border-ink-200/60"
+        fallbackClassName="text-brand-500 font-extrabold text-sm"
+      />
       {!compact && (
         <div className="leading-tight min-w-0">
           <div className="font-extrabold text-ink-900 font-display text-base truncate">{name}</div>

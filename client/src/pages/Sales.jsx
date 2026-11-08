@@ -23,6 +23,7 @@ import { api } from "../api/client.js";
 import { formatINR, formatDate, relativeTime } from "../lib/format.js";
 import { buildInvoicePrintHtml } from "../lib/invoicePrint.js";
 import PageHeader from "../components/PageHeader.jsx";
+import BusinessLogo from "../components/BusinessLogo.jsx";
 import Modal from "../components/Modal.jsx";
 import EmptyState from "../components/EmptyState.jsx";
 import Select from "../components/Select.jsx";
@@ -1053,7 +1054,12 @@ function InvoiceModal({ invoice, onClose, onChanged }) {
         {/* Header */}
         <div className="flex items-start justify-between pb-4 border-b border-ink-200">
           <div className="flex items-center gap-3">
-            {invoice.business?.logo && <img src={invoice.business.logo} alt="" className="w-12 h-12 rounded-xl object-cover" />}
+            <BusinessLogo
+              logo={invoice.business?.logo}
+              name={invoice.business?.name}
+              className="w-16 h-16 rounded-xl border border-ink-200/60"
+              fallbackClassName="text-brand-500 font-extrabold"
+            />
             <div>
               <div className="font-display font-extrabold text-2xl text-ink-900">{invoice.business?.name || "Bizzrow"}</div>
               {invoice.business?.address && <div className="text-xs text-ink-500">{invoice.business.address}</div>}
@@ -1080,7 +1086,7 @@ function InvoiceModal({ invoice, onClose, onChanged }) {
         </div>
 
         <div className="overflow-x-auto">
-        <table className="w-full min-w-[690px] mt-3 text-sm">
+        <table className="w-full min-w-[620px] mt-3 text-sm">
           <thead>
             <tr className="border-b border-ink-200/60 text-left text-xs uppercase tracking-wider text-ink-500">
               <th className="py-2 font-semibold">Item</th>
@@ -1088,7 +1094,6 @@ function InvoiceModal({ invoice, onClose, onChanged }) {
               <th className="py-2 font-semibold text-right">Unit</th>
               <th className="py-2 font-semibold text-right">Rate</th>
               <th className="py-2 font-semibold text-right">Discount</th>
-              <th className="py-2 font-semibold text-right">Tax</th>
               <th className="py-2 font-semibold text-right">Amount</th>
             </tr>
           </thead>
@@ -1107,17 +1112,12 @@ function InvoiceModal({ invoice, onClose, onChanged }) {
                 <td className="py-2.5 text-right text-ink-700">{it.unit || "—"}</td>
                 <td className="py-2.5 text-right text-ink-700">{formatINR(it.unitPrice)}</td>
                 <td className="py-2.5 text-right text-ink-700">{Number(it.discountAmount) ? formatINR(it.discountAmount) : "—"}</td>
-                <td className="py-2.5 text-right text-ink-700">{Number(it.taxAmount) ? formatINR(it.taxAmount) : "—"}</td>
                 <td className="py-2.5 text-right font-medium text-ink-800">{formatINR(it.subtotal)}</td>
               </tr>
             ))}
           </tbody>
         </table>
         </div>
-        {!(invoice.taxBreakdown?.length) && !(invoice.items || []).some((item) => Number(item.taxAmount)) && (
-          <p className="text-[11px] text-ink-400 mt-2">Tax was not itemized in the saved sale.</p>
-        )}
-
         <div className="mt-4 ml-auto max-w-xs space-y-1.5 text-sm">
           <Row label="Items subtotal" value={formatINR(invoice.subtotal ?? invoice.total)} />
           {invoice.itemDiscountTotal > 0 && <Row label="Line discounts (included above)" value={`− ${formatINR(invoice.itemDiscountTotal)}`} positive />}
@@ -1131,6 +1131,14 @@ function InvoiceModal({ invoice, onClose, onChanged }) {
           {!invoice.billDiscountAmount && invoice.totalDiscount > 0 && !invoice.itemDiscountTotal && (
             <Row label="Discount" value={`− ${formatINR(invoice.totalDiscount)}`} positive />
           )}
+          <div className="my-2 rounded-lg border border-ink-200/60 p-2.5">
+            <div className="text-[10px] font-semibold uppercase tracking-wider text-ink-500 mb-1">Tax summary</div>
+            <Row label="Taxable amount" value="Not recorded" muted />
+            <Row label="CGST" value="—" muted />
+            <Row label="SGST" value="—" muted />
+            <Row label="IGST" value="—" muted />
+            <Row label="Total tax" value="Not recorded" muted />
+          </div>
           <Row label="Total" value={formatINR(invoice.total)} />
           {invoice.returnedAmount > 0 && (
             <>
@@ -1143,6 +1151,25 @@ function InvoiceModal({ invoice, onClose, onChanged }) {
           <Row label="Paid" value={formatINR(invoice.amountPaid)} positive />
           <Row label="Due" value={formatINR(invoice.dueAmount)} negative={invoice.dueAmount > 0} bold />
         </div>
+        {Object.values(invoice.business?.bankDetails || {}).some((value) => typeof value === "string" && value.trim()) && (
+          <section className="mt-5 rounded-xl border border-ink-200/60 p-4">
+            <h3 className="text-xs font-semibold uppercase tracking-wider text-ink-500 mb-3">Bank details</h3>
+            <dl className="grid grid-cols-1 sm:grid-cols-2 gap-3 text-sm">
+              {[
+                ["Bank name", invoice.business.bankDetails.bankName],
+                ["Account holder", invoice.business.bankDetails.accountHolderName],
+                ["Account number", invoice.business.bankDetails.accountNumber],
+                ["IFSC", invoice.business.bankDetails.ifscCode],
+                ["Branch", invoice.business.bankDetails.branchName],
+              ].filter(([, value]) => typeof value === "string" && value.trim()).map(([label, value]) => (
+                <div key={label} className="min-w-0">
+                  <dt className="text-[10px] uppercase tracking-wider text-ink-400">{label}</dt>
+                  <dd className="mt-0.5 break-words text-ink-800">{value}</dd>
+                </div>
+              ))}
+            </dl>
+          </section>
+        )}
         {Array.isArray(invoice.invoiceTerms) && invoice.invoiceTerms.length > 0 && (
           <div className="mt-5 pt-4 border-t border-ink-200/50">
             <div className="text-xs font-semibold uppercase tracking-wider text-ink-500 mb-2">Terms and conditions</div>

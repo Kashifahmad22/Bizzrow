@@ -1,4 +1,5 @@
 const PDFDocument = require("pdfkit");
+const { drawBusinessLogo } = require("../utils/businessLogo");
 
 const COLORS = {
   ink: "#202438",
@@ -39,38 +40,21 @@ function dateLabel(value) {
     : "Not recorded";
 }
 
-function imageBuffer(dataUrl) {
-  if (typeof dataUrl !== "string") return null;
-  const match = dataUrl.match(/^data:image\/(png|jpe?g);base64,([A-Za-z\d+/=]+)$/i);
-  return match ? Buffer.from(match[2], "base64") : null;
+function bankDetailEntries(business) {
+  const fields = [
+    ["Bank name", business.bankDetails?.bankName],
+    ["Account holder", business.bankDetails?.accountHolderName],
+    ["Account number", business.bankDetails?.accountNumber],
+    ["IFSC", business.bankDetails?.ifscCode],
+    ["Branch", business.bankDetails?.branchName],
+  ];
+  return fields.filter(([, value]) => typeof value === "string" && value.trim());
 }
 
 function termsForSale(sale) {
   return Array.isArray(sale.invoiceTermsSnapshot)
     ? sale.invoiceTermsSnapshot.filter((term) => typeof term === "string" && term.trim())
     : [];
-}
-
-function taxLines(sale) {
-  const rows = [];
-  for (const entry of Array.isArray(sale.taxBreakdown) ? sale.taxBreakdown : []) {
-    if (entry && Number.isFinite(Number(entry.amount ?? entry.taxAmount))) {
-      rows.push({
-        label: printable(entry.label || entry.name || "Tax"),
-        amount: number(entry.amount ?? entry.taxAmount),
-      });
-    }
-  }
-  if (rows.length) return rows;
-  for (const [index, item] of (sale.items || []).entries()) {
-    if (Number.isFinite(Number(item.taxAmount)) && number(item.taxAmount) !== 0) {
-      rows.push({
-        label: `Tax${item.taxRate != null ? ` (${item.taxRate}%)` : ""} - item ${index + 1}`,
-        amount: number(item.taxAmount),
-      });
-    }
-  }
-  return rows;
 }
 
 function invoiceRows(sale) {
@@ -88,7 +72,12 @@ function invoiceRows(sale) {
   if (number(sale.totalDiscount) > 0 && !number(sale.itemDiscountTotal) && !number(sale.billDiscountAmount)) {
     rows.push(["Discount", `- ${currency(sale.totalDiscount)}`]);
   }
-  for (const tax of taxLines(sale)) rows.push([tax.label, currency(tax.amount)]);
+  rows.push(["TAX SUMMARY", "", "tax-header"]);
+  rows.push(["Taxable amount", "Not recorded", "tax"]);
+  rows.push(["CGST", "—", "tax"]);
+  rows.push(["SGST", "—", "tax"]);
+  rows.push(["IGST", "—", "tax"]);
+  rows.push(["Total tax", "Not recorded", "tax-total"]);
   rows.push(["Grand total", currency(sale.total), "grand"]);
 
   for (const payment of Array.isArray(sale.payments) ? sale.payments : []) {
@@ -125,15 +114,7 @@ function drawA4Header(doc, sale, business, continuation = false) {
   const left = 40;
   const right = 555;
   let textX = left;
-  const logo = imageBuffer(business.logo);
-  if (logo) {
-    try {
-      doc.image(logo, left, 36, { fit: [52, 52] });
-      textX += 62;
-    } catch {
-      textX = left;
-    }
-  }
+  if (drawBusinessLogo(doc, business.logo, left, 34, 58, 52)) textX += 66;
 
   doc.fillColor(COLORS.ink).font("Helvetica-Bold").fontSize(18)
     .text(printable(business.name, "Bizzrow"), textX, 37, { width: 285 });
@@ -193,8 +174,7 @@ const A4_COLUMNS = [
   { key: "unit", title: "UNIT", x: 272, width: 30, align: "right" },
   { key: "rate", title: "RATE", x: 303, width: 57, align: "right" },
   { key: "discount", title: "DISC.", x: 361, width: 55, align: "right" },
-  { key: "tax", title: "TAX", x: 417, width: 48, align: "right" },
-  { key: "amount", title: "LINE TOTAL", x: 466, width: 89, align: "right" },
+  { key: "amount", title: "LINE TOTAL", x: 417, width: 138, align: "right" },
 ];
 
 function drawA4TableHeader(doc, y) {
@@ -267,7 +247,6 @@ function buildA4(sale, business, customer) {
           unit: printable(item.unit || ""),
           rate: currency(item.unitPrice),
           discount: number(item.discountAmount) ? currency(item.discountAmount) : "-",
-          tax: number(item.taxAmount) ? currency(item.taxAmount) : "-",
           amount: currency(item.subtotal ?? number(item.unitPrice) * number(item.quantity)),
         };
         for (const column of A4_COLUMNS.slice(2)) {
@@ -284,13 +263,6 @@ function buildA4(sale, business, customer) {
         y += 3;
       });
 
-      if (!taxLines(sale).length) {
-        if (y + 18 > pageBottom) y = addContinuationPage();
-        doc.font("Helvetica").fontSize(7).fillColor(COLORS.muted)
-          .text("Tax was not itemized in the saved sale.", 40, y, { width: 515 });
-        y += 12;
-      }
-
       const rows = invoiceRows(sale);
       const totalsHeight = rows.length * 17 + 23;
       if (y + totalsHeight > pageBottom) y = addContinuationPage();
@@ -298,13 +270,55 @@ function buildA4(sale, business, customer) {
       doc.moveTo(330, y).lineTo(555, y).strokeColor(COLORS.line).lineWidth(0.8).stroke();
       y += 10;
       for (const [label, value, kind] of rows) {
+        if (kind === "tax-header") {
+          y += 3;
+          doc.moveTo(330, y).lineTo(555, y).strokeColor(COLORS.line).lineWidth(0.5).stroke();
+          y += 6;
+          doc.font("Helvetica-Bold").fontSize(7).fillColor(COLORS.muted)
+            .text(label, 330, y, { width: 225 });
+          y += 13;
+          continue;
+        }
         const bold = kind === "grand" || kind === "due";
         const color = kind === "due" ? (number(sale.dueAmount) > 0 ? COLORS.red : COLORS.green)
           : kind === "credit" ? COLORS.green : COLORS.ink;
-        doc.font(bold ? "Helvetica-Bold" : "Helvetica").fontSize(bold ? 9 : 8).fillColor(color);
+        const rowBold = bold || kind === "tax-total";
+        doc.font(rowBold ? "Helvetica-Bold" : "Helvetica").fontSize(rowBold ? 9 : 8).fillColor(color);
         doc.text(printable(label), 330, y, { width: 130, fontSize: bold ? 9 : 8 });
         doc.text(printable(value), 460, y, { width: 95, align: "right", lineBreak: false });
-        y += bold ? 18 : 15;
+        y += rowBold ? 18 : 15;
+      }
+
+      const bankDetails = bankDetailEntries(business);
+      if (bankDetails.length) {
+        y += 9;
+        if (y + 30 > pageBottom) y = addContinuationPage();
+        doc.font("Helvetica-Bold").fontSize(8).fillColor(COLORS.ink).text("BANK DETAILS", 40, y);
+        y += 14;
+        for (let index = 0; index < bankDetails.length; index += 2) {
+          const pair = bankDetails.slice(index, index + 2);
+          const cells = pair.map(([label, value], cellIndex) => {
+            const x = cellIndex === 0 ? 40 : 305;
+            const width = cellIndex === 0 ? 255 : 250;
+            const text = printable(value);
+            doc.font("Helvetica").fontSize(7).fillColor(COLORS.muted);
+            const height = doc.heightOfString(text, { width, fontSize: 7, lineGap: 1 });
+            return { label, text, x, width, height };
+          });
+          const rowHeight = Math.max(...cells.map((cell) => cell.height)) + 15;
+          if (y + rowHeight > pageBottom) {
+            y = addContinuationPage();
+            doc.font("Helvetica-Bold").fontSize(8).fillColor(COLORS.ink).text("BANK DETAILS (CONT.)", 40, y);
+            y += 14;
+          }
+          for (const cell of cells) {
+            doc.font("Helvetica-Bold").fontSize(7).fillColor(COLORS.muted)
+              .text(`${cell.label}:`, cell.x, y, { width: cell.width, lineBreak: false });
+            doc.font("Helvetica").fontSize(7).fillColor(COLORS.ink)
+              .text(cell.text, cell.x, y + 9, { width: cell.width, fontSize: 7, lineGap: 1 });
+          }
+          y += rowHeight;
+        }
       }
 
       const terms = termsForSale(sale);
@@ -352,6 +366,7 @@ function estimateThermalHeight(sale, business, customer, width) {
   const charsPerLine = Math.max(19, Math.floor(textWidth / (width < 180 ? 3.1 : 3.5)));
   const wrapLines = (value) => Math.max(1, Math.ceil(printable(value).length / charsPerLine));
   let height = 166 + wrapLines(business.name || "Bizzrow") * 12;
+  if (business.logo) height += 32;
   for (const value of [business.address, business.phone, business.email, business.gstNumber, customer.name || sale.customerName]) {
     if (value) height += wrapLines(value) * 9;
   }
@@ -362,6 +377,11 @@ function estimateThermalHeight(sale, business, customer, width) {
   }
   height += invoiceRows(sale).length * 13 + 36;
   for (const term of termsForSale(sale)) height += wrapLines(term) * 8 + 4;
+  const bankDetails = bankDetailEntries(business);
+  if (bankDetails.length) {
+    height += 16;
+    for (const [label, value] of bankDetails) height += wrapLines(`${label}: ${value}`) * 8;
+  }
   return Math.max(360, Math.ceil(height + 35));
 }
 
@@ -431,6 +451,9 @@ function buildThermal(sale, business, customer, width) {
         y += rowHeight;
       };
 
+      if (drawBusinessLogo(doc, business.logo, margin + 10, y, contentWidth - 20, width < 180 ? 24 : 28, "center")) {
+        y += width < 180 ? 28 : 32;
+      }
       centered(business.name || "Bizzrow", width < 180 ? 10 : 12, true);
       for (const line of [business.address, business.phone, business.email, business.gstNumber && `GSTIN: ${business.gstNumber}`]) {
         if (line) centered(line, smallFontSize);
@@ -453,13 +476,23 @@ function buildThermal(sale, business, customer, width) {
         if (number(item.discountAmount)) rightRow("  Line discount", `- ${currency(item.discountAmount)}`, smallFontSize, false, COLORS.green);
       }
       separator();
-      if (!taxLines(sale).length) left("Tax was not itemized in the saved sale.", smallFontSize);
 
       for (const [label, value, kind] of invoiceRows(sale)) {
+        if (kind === "tax-header") {
+          separator();
+          left(label, fontSize, true);
+          continue;
+        }
         rightRow(label, value, kind === "grand" || kind === "due" ? fontSize + 0.5 : fontSize,
-          kind === "grand" || kind === "due",
+          kind === "grand" || kind === "due" || kind === "tax-total",
           kind === "due" ? (number(sale.dueAmount) > 0 ? COLORS.red : COLORS.green)
             : kind === "credit" ? COLORS.green : COLORS.ink);
+      }
+      const bankDetails = bankDetailEntries(business);
+      if (bankDetails.length) {
+        separator();
+        left("BANK DETAILS", fontSize, true);
+        for (const [label, value] of bankDetails) left(`${label}: ${value}`, smallFontSize);
       }
       if (termsForSale(sale).length) {
         separator();
