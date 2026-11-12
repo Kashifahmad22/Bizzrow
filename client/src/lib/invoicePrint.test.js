@@ -37,9 +37,10 @@ test("A4 browser print escapes data and uses saved payments, balance, and terms"
   assert.match(html, /@page \{ size: A4 portrait; margin: 10mm; \}/);
   assert.match(html, /grid-template-columns: minmax\(0, 1fr\) minmax\(72mm, 88mm\)/);
   assert.match(html, /Authorized signature/);
-  assert.match(html, /height:277mm/);
-  assert.match(html, /printableHeight-2/);
-  assert.match(html, /too long to print on one A4 page/);
+  // Multi-page A4 printing: the former one-page guard is gone and CSS handles
+  // pagination (repeated table headings, unsplit rows/terms).
+  assert.doesNotMatch(html, /too long to print on one A4 page/);
+  assert.match(html, /thead \{ display: table-header-group; \}/);
   assert.match(html, /Test Customer &lt;script&gt;alert\(1\)&lt;\/script&gt;/);
   assert.doesNotMatch(html, /<script>alert\(1\)<\/script>/);
   assert.match(html, /Cash/);
@@ -50,6 +51,25 @@ test("A4 browser print escapes data and uses saved payments, balance, and terms"
     ...invoice,
     returnHistory: [{ type: "return", refundAmount: 10, refundPayments: [{ method: "cash", amount: 10 }] }],
   }), /Refund - Cash/);
+});
+
+test("GST summary is extracted from inclusive prices only when gstPct snapshots exist", () => {
+  const legacy = buildInvoicePrintHtml(invoice, "a4");
+  assert.doesNotMatch(legacy, /GST SUMMARY \(INCLUDED IN PRICES\)/);
+  const withGst = buildInvoicePrintHtml({
+    ...invoice,
+    billDiscountAmount: 0,
+    items: [{ ...invoice.items[0], subtotal: 118, gstPct: 18 }],
+    subtotal: 118,
+    total: 118,
+  }, "a4");
+  assert.match(withGst, /GST SUMMARY \(INCLUDED IN PRICES\)/);
+  assert.match(withGst, /Taxable value @ 18%/);
+  assert.match(withGst, /GST @ 18% \(included\)/);
+  assert.match(withGst, /Total GST included/);
+  assert.match(withGst, /Rs\. 18\.00/);
+  // Grand total is unchanged — GST is included, never added on top.
+  assert.ok(withGst.indexOf("GST SUMMARY") < withGst.indexOf("Grand total"));
 });
 
 test("thermal browser layouts use dedicated narrow widths", () => {
@@ -127,7 +147,7 @@ test("browser print hides empty bank details and contains logos in consistent fr
     }, format);
     assert.match(html, /object-fit: contain/);
     assert.match(html, /object-position: center/);
-    assert.match(html, /width: (19|20)mm; height: \1mm/);
+    assert.match(html, /width: (26|20)mm; height: \1mm/);
     assert.match(html, /background: #fff/);
   }
 });

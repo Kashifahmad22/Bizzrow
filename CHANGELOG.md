@@ -1,5 +1,24 @@
 # Bizzrow — Changelog
 
+## v1.3 — Invoice Pagination, GST Breakdown & Release Audit
+
+### Invoice printing and PDF
+- **A4 invoices now paginate** instead of rejecting long content: business header on every page, item-table headings repeated per page, rows never split, dynamic `Page N of M` footers (buffered pages), totals/bank details side-by-side when they fit and flowing otherwise.
+- **Terms and conditions** render once as a keep-together block (moved whole to the next page when needed, never split or repeated). Terms remain per-business editable in Settings and snapshotted per sale.
+- **Logo enlarged** (A4: 54×48 → 74×60 pt fit box; browser print 19 → 26 mm), aspect ratio preserved.
+- **Browser A4 printing supports multiple pages** (former "too long to print" guard removed; CSS repeats table headings and keeps rows/terms/footer unsplit).
+
+### GST (display-only, inclusive extraction)
+- New per-item **`gstPct` snapshot** captured at sale time (`Sale.items[].gstPct`, null on legacy items) so historical invoices never change.
+- New `server/utils/invoiceTax.js` + client mirror: per-rate **taxable value and GST included** summary on PDF and browser invoices, mixed rates grouped, bill discounts allocated proportionally. GST is extracted from GST-inclusive prices — **never added on top**; grand totals unchanged. Legacy sales show no summary (unchanged output).
+
+### Performance & reliability
+- New **PDF rate limit** (60/min per IP, `RATE_LIMIT_PDF_*` overridable) alongside existing auth/search/dashboard limits.
+- PDF generation measured: 24–133 ms for 1–30 item invoices (1–2 pages).
+
+### Tests
+- Server 187/187 (new `invoiceTax.test.js`, invoice pagination matrix for 1/5/15/30/80 items incl. repeated headers, footer band, unsplit terms), client 28/28, browser e2e 21/21, builds green.
+
 ## v1.2 — Product Search, Loading Performance & UX Sprint
 
 ### Product search & loading (P0)

@@ -18,6 +18,9 @@ const saleItemSchema = new mongoose.Schema(
     legacyQuantityFirst: { type: Number, default: 0, min: 0 },
     quantity: { type: Number, required: true, min: 0 },
     unitPrice: { type: Number, required: true, min: 0 },
+    // GST rate snapshot at sale time (display-only; prices are GST-inclusive).
+    // null on legacy items — their invoices show no GST breakdown.
+    gstPct: { type: Number, default: null, min: 0 },
     // Item-level discount (Master Sprint). Backward compatible: defaults to none.
     discountType: { type: String, enum: ["percent", "amount"], default: "amount" },
     discountValue: { type: Number, default: 0, min: 0 },

@@ -1,5 +1,6 @@
 const PDFDocument = require("pdfkit");
 const { drawBusinessLogo } = require("../utils/businessLogo");
+const { gstSummary } = require("../utils/invoiceTax");
 
 const COLORS = {
   ink: "#202438",
@@ -82,6 +83,17 @@ function invoiceRows(sale) {
     const taxAmount = entry?.amount ?? entry?.taxAmount;
     rows.push([printable(entry.label || entry.name || "Tax"), currency(taxAmount), "tax"]);
   }
+  // GST breakdown extracted from GST-inclusive prices using per-item gstPct
+  // snapshots. Display-only: tax is already included, never added on top.
+  const gst = gstSummary(sale);
+  if (gst) {
+    rows.push(["GST SUMMARY (INCLUDED IN PRICES)", "", "tax-header"]);
+    for (const entry of gst.rates) {
+      rows.push([`Taxable value @ ${entry.rate}%`, currency(entry.taxable), "tax"]);
+      rows.push([`GST @ ${entry.rate}% (included)`, currency(entry.gstAmount), "tax"]);
+    }
+    rows.push(["Total GST included", currency(gst.totalGst), "tax-total"]);
+  }
   rows.push(["Grand total", currency(sale.total), "grand"]);
 
   for (const payment of Array.isArray(sale.payments) ? sale.payments : []) {
@@ -122,7 +134,8 @@ function drawA4Header(doc, sale, business) {
   const left = 40;
   const right = 555;
   let textX = left;
-  if (drawBusinessLogo(doc, business.logo, left, 32, 54, 48)) textX += 62;
+  // Larger, aspect-ratio-preserving logo (fit box, never stretched).
+  if (drawBusinessLogo(doc, business.logo, left, 30, 74, 60)) textX += 84;
   const businessWidth = 350 - textX;
 
   const businessName = printable(business.name, "Bizzrow");
@@ -224,11 +237,19 @@ function buildA4(sale, business, customer) {
       doc.on("end", () => resolve(Buffer.concat(chunks)));
       doc.on("error", reject);
 
+      // Reserved footer band: content never collides with the per-page footer.
+      const contentBottom = doc.page.height - 60;
+      const newPage = () => {
+        doc.addPage();
+        return drawA4Header(doc, sale, business);
+      };
+
       let y = drawA4Header(doc, sale, business);
       y = drawA4Customer(doc, sale, customer, y);
       y += 2;
       y = drawA4TableHeader(doc, y);
 
+      // Item rows: never split a row; repeat the table heading on new pages.
       (sale.items || []).forEach((item, index) => {
         const itemLines = [
           printable(item.name, "Item"),
@@ -238,6 +259,11 @@ function buildA4(sale, business, customer) {
         const itemHeight = itemLines.reduce((height, line, lineIndex) =>
           height + doc.heightOfString(line, { width: A4_COLUMNS[1].width, fontSize: lineIndex ? 6.8 : 7.5, lineGap: 0.5 }), 0);
         const rowHeight = Math.max(16, itemHeight + 5);
+
+        if (y + rowHeight + 4 > contentBottom) {
+          y = newPage();
+          y = drawA4TableHeader(doc, y);
+        }
 
         doc.font("Helvetica").fontSize(8).fillColor(COLORS.muted)
           .text(String(index + 1), A4_COLUMNS[0].x, y + 2, { width: A4_COLUMNS[0].width, lineBreak: false });
@@ -274,60 +300,122 @@ function buildA4(sale, business, customer) {
 
       const rows = invoiceRows(sale);
       const bankDetails = bankDetailEntries(business);
-      const sectionY = y + 7;
-      let summaryY = sectionY + 5;
-      doc.moveTo(330, sectionY).lineTo(555, sectionY).strokeColor(COLORS.line).lineWidth(0.8).stroke();
-      for (const [label, value, kind] of rows) {
-        const bold = kind === "grand" || kind === "due";
-        const color = kind === "due" ? (number(sale.dueAmount) > 0 ? COLORS.red : COLORS.green)
-          : kind === "credit" ? COLORS.green : COLORS.ink;
-        const rowBold = bold;
-        const size = rowBold ? 8.5 : 7.2;
-        doc.font(rowBold ? "Helvetica-Bold" : "Helvetica").fontSize(size).fillColor(color);
-        doc.text(printable(label), 330, summaryY, { width: 135, fontSize: size, lineBreak: false });
-        doc.text(printable(value), 465, summaryY, { width: 90, align: "right", fontSize: size, lineBreak: false });
-        summaryY += rowBold ? 13 : 10.5;
-      }
 
-      let bankY = sectionY + 7;
-      if (bankDetails.length) {
-        doc.font("Helvetica-Bold").fontSize(7.5).fillColor(COLORS.muted).text("BANK DETAILS", 40, bankY);
-        bankY += 12;
-        for (const [label, value] of bankDetails) {
-          const text = printable(value);
-          const height = doc.heightOfString(text, { width: 190, fontSize: 7.2, lineGap: 0.5 });
-          doc.font("Helvetica-Bold").fontSize(7.2).fillColor(COLORS.muted)
-            .text(`${label}:`, 40, bankY, { width: 76, fontSize: 7.2, lineBreak: false });
-          doc.font("Helvetica").fontSize(7.2).fillColor(COLORS.ink)
-            .text(text, 116, bankY, { width: 190, fontSize: 7.2, lineGap: 0.5 });
-          bankY += Math.max(10, height + 1);
+      // Measure the totals and bank blocks so the common single-page invoice
+      // keeps them side by side; oversized content flows onto later pages.
+      const summaryRowHeight = ([, , kind]) => (kind === "grand" || kind === "due" ? 13 : 10.5);
+      const summaryHeight = rows.reduce((height, row) => height + summaryRowHeight(row), 12);
+      doc.font("Helvetica").fontSize(7.2);
+      const bankHeight = bankDetails.length
+        ? bankDetails.reduce((height, [, value]) =>
+          height + Math.max(10, doc.heightOfString(printable(value), { width: 190, fontSize: 7.2, lineGap: 0.5 }) + 1), 19)
+        : 0;
+      const sideBySideHeight = Math.max(summaryHeight, bankHeight) + 7;
+
+      if (y + sideBySideHeight > contentBottom) y = newPage();
+
+      if (y + sideBySideHeight <= contentBottom) {
+        const sectionY = y + 7;
+        doc.moveTo(330, sectionY).lineTo(555, sectionY).strokeColor(COLORS.line).lineWidth(0.8).stroke();
+        let summaryY = sectionY + 5;
+        for (const [label, value, kind] of rows) {
+          const bold = kind === "grand" || kind === "due" || kind === "tax-total";
+          const color = kind === "due" ? (number(sale.dueAmount) > 0 ? COLORS.red : COLORS.green)
+            : kind === "credit" ? COLORS.green : kind === "tax" || kind === "tax-header" ? COLORS.muted : COLORS.ink;
+          const size = kind === "grand" || kind === "due" ? 8.5 : kind === "tax" || kind === "tax-header" ? 6.8 : 7.2;
+          doc.font(bold ? "Helvetica-Bold" : "Helvetica").fontSize(size).fillColor(color);
+          doc.text(printable(label), 330, summaryY, { width: 135, fontSize: size, lineBreak: false });
+          doc.text(printable(value), 465, summaryY, { width: 90, align: "right", fontSize: size, lineBreak: false });
+          summaryY += summaryRowHeight([label, value, kind]);
+        }
+        let bankY = sectionY + 7;
+        if (bankDetails.length) {
+          doc.font("Helvetica-Bold").fontSize(7.5).fillColor(COLORS.muted).text("BANK DETAILS", 40, bankY);
+          bankY += 12;
+          for (const [label, value] of bankDetails) {
+            const text = printable(value);
+            const height = doc.heightOfString(text, { width: 190, fontSize: 7.2, lineGap: 0.5 });
+            doc.font("Helvetica-Bold").fontSize(7.2).fillColor(COLORS.muted)
+              .text(`${label}:`, 40, bankY, { width: 76, fontSize: 7.2, lineBreak: false });
+            doc.font("Helvetica").fontSize(7.2).fillColor(COLORS.ink)
+              .text(text, 116, bankY, { width: 190, fontSize: 7.2, lineGap: 0.5 });
+            bankY += Math.max(10, height + 1);
+          }
+        }
+        y = Math.max(summaryY, bankY);
+      } else {
+        // Very long totals (for example extensive return history): flow the
+        // summary row by row across pages, then the bank block.
+        y += 7;
+        doc.moveTo(330, y).lineTo(555, y).strokeColor(COLORS.line).lineWidth(0.8).stroke();
+        y += 5;
+        for (const [label, value, kind] of rows) {
+          const rowHeight = summaryRowHeight([label, value, kind]);
+          if (y + rowHeight > contentBottom) y = newPage() + 4;
+          const bold = kind === "grand" || kind === "due" || kind === "tax-total";
+          const color = kind === "due" ? (number(sale.dueAmount) > 0 ? COLORS.red : COLORS.green)
+            : kind === "credit" ? COLORS.green : kind === "tax" || kind === "tax-header" ? COLORS.muted : COLORS.ink;
+          const size = kind === "grand" || kind === "due" ? 8.5 : kind === "tax" || kind === "tax-header" ? 6.8 : 7.2;
+          doc.font(bold ? "Helvetica-Bold" : "Helvetica").fontSize(size).fillColor(color);
+          doc.text(printable(label), 330, y, { width: 135, fontSize: size, lineBreak: false });
+          doc.text(printable(value), 465, y, { width: 90, align: "right", fontSize: size, lineBreak: false });
+          y += rowHeight;
+        }
+        if (bankDetails.length) {
+          if (y + bankHeight + 6 > contentBottom) y = newPage();
+          y += 6;
+          doc.font("Helvetica-Bold").fontSize(7.5).fillColor(COLORS.muted).text("BANK DETAILS", 40, y);
+          y += 12;
+          for (const [label, value] of bankDetails) {
+            const text = printable(value);
+            const height = doc.heightOfString(text, { width: 190, fontSize: 7.2, lineGap: 0.5 });
+            doc.font("Helvetica-Bold").fontSize(7.2).fillColor(COLORS.muted)
+              .text(`${label}:`, 40, y, { width: 76, fontSize: 7.2, lineBreak: false });
+            doc.font("Helvetica").fontSize(7.2).fillColor(COLORS.ink)
+              .text(text, 116, y, { width: 190, fontSize: 7.2, lineGap: 0.5 });
+            y += Math.max(10, height + 1);
+          }
         }
       }
 
-      let termsY = Math.max(summaryY, bankY) + 6;
+      // Terms and conditions: one block, never split across pages and never
+      // repeated. If the block does not fit the remaining space, it moves
+      // whole to the next page (flowing only in the extreme case where the
+      // terms alone exceed a full page).
       const terms = termsForSale(sale);
       if (terms.length) {
-        doc.font("Helvetica-Bold").fontSize(7).fillColor(COLORS.muted).text("TERMS", 40, termsY);
-        termsY += 10;
+        doc.font("Helvetica").fontSize(7);
+        const termHeights = terms.map((term, index) =>
+          doc.heightOfString(`${index + 1}. ${printable(term)}`, { width: 515, fontSize: 7, lineGap: 0.5 }) + 1);
+        const termsHeight = 16 + termHeights.reduce((sum, height) => sum + height, 0);
+        const fullPageSpace = contentBottom - 130;
+        if (y + termsHeight + 6 > contentBottom && termsHeight <= fullPageSpace) y = newPage();
+        y += 6;
+        doc.font("Helvetica-Bold").fontSize(7).fillColor(COLORS.muted).text("TERMS AND CONDITIONS", 40, y);
+        y += 10;
         for (const [index, term] of terms.entries()) {
+          if (y + termHeights[index] > contentBottom) y = newPage() + 4;
           const text = `${index + 1}. ${printable(term)}`;
           doc.font("Helvetica").fontSize(7).fillColor(COLORS.muted);
-          const height = doc.heightOfString(text, { width: 515, fontSize: 7, lineGap: 0.5 });
-          doc.text(text, 40, termsY, { width: 515, fontSize: 7, lineGap: 0.5 });
-          termsY += height + 1;
+          doc.text(text, 40, y, { width: 515, fontSize: 7, lineGap: 0.5 });
+          y += termHeights[index];
         }
       }
 
-      const signatureY = Math.max(termsY, bankY, summaryY) + 8;
-      const contentBottom = doc.page.height - 58;
-      if (signatureY + 35 > contentBottom) {
-        throw new Error("Invoice content exceeds the one-page A4 printable area.");
-      }
+      // Signature block stays whole.
+      if (y + 43 > contentBottom) y = newPage();
+      const signatureY = y + 8;
       doc.font("Helvetica").fontSize(8).fillColor(COLORS.muted)
         .text("Thank you for your business.", 40, signatureY, { width: 260, lineBreak: false });
       doc.moveTo(410, signatureY + 18).lineTo(555, signatureY + 18).strokeColor(COLORS.muted).lineWidth(0.6).stroke();
       doc.font("Helvetica").fontSize(7).text("Authorized signature", 410, signatureY + 21, { width: 145, align: "center", lineBreak: false });
-      drawA4Footer(doc, 1, 1, business);
+
+      // Dynamic page numbers: footers are stamped once the page count is known.
+      const range = doc.bufferedPageRange();
+      for (let index = 0; index < range.count; index += 1) {
+        doc.switchToPage(range.start + index);
+        drawA4Footer(doc, index + 1, range.count, business);
+      }
       doc.end();
     } catch (error) {
       reject(error);
