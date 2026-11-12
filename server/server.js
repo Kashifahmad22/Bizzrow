@@ -39,9 +39,15 @@ const recoveryLimit = configuredRateLimit("RECOVERY", 10, 15 * 60 * 1000);
 const searchLimit = configuredRateLimit("SEARCH", 300, 60 * 1000);
 const dashboardLimit = configuredRateLimit("DASHBOARD", 120, 60 * 1000);
 const externalLimit = configuredRateLimit("EXTERNAL", 30, 60 * 1000);
+// PDF generation is CPU-bound; limit per IP without blocking normal billing.
+const pdfLimit = configuredRateLimit("PDF", 60, 60 * 1000);
 app.use("/api/auth", authRateLimits(authLimit, recoveryLimit));
 app.use(["/api/products", "/api/customers", "/api/sales"], (req, res, next) => {
   if (req.method === "GET" && req.path === "/" && req.query.q) return searchLimit(req, res, next);
+  next();
+});
+app.use("/api/sales", (req, res, next) => {
+  if (req.method === "GET" && /\/invoice\/pdf$/.test(req.path)) return pdfLimit(req, res, next);
   next();
 });
 app.use(["/api/dashboard", "/api/business-health"], dashboardLimit);

@@ -126,15 +126,65 @@ test("A4 one-page output remains valid with partial or missing banking and no lo
   }
 });
 
-test("A4 overflow is rejected instead of spilling invoice content onto a second page", async () => {
-  const sale = fixture({ items: Array.from({ length: 80 }, (_, index) => ({
-    ...fixture().items[0],
-    name: `Long product ${index + 1} - ${"detailed item description ".repeat(3)}`,
-  })) });
-  await assert.rejects(
-    buildInvoicePdfDocument(sale, { name: "Test Business" }, { name: "Test Customer" }),
-    /exceeds the one-page A4 printable area/
-  );
+test("long invoices paginate with repeated headers instead of being rejected", async () => {
+  const business = { name: "Test Business", logo: logoDataUrl(40, 40), phone: "9000000000" };
+  const customer = { name: "Test Customer" };
+  const originalText = PDFDocument.prototype.text;
+
+  const capture = async (sale) => {
+    const calls = [];
+    PDFDocument.prototype.text = function (text, x, y, options) {
+      const page = this.page;
+      const result = originalText.call(this, text, x, y, options);
+      calls.push({ text: String(text), x, y, end: this.y, page });
+      return result;
+    };
+    try {
+      const pdf = await buildInvoicePdfDocument(sale, business, customer);
+      return { pdf, calls };
+    } finally {
+      PDFDocument.prototype.text = originalText;
+    }
+  };
+
+  // 1, 5 and 15 items fit a single page; 30 and 80 items paginate.
+  const pagesFor = {};
+  for (const count of [1, 5, 15, 30, 80]) {
+    const sale = fixture({ items: Array.from({ length: count }, (_, index) => ({
+      ...fixture().items[0],
+      name: `Long product ${index + 1} - ${"detailed item description ".repeat(3)}`,
+    })) });
+    const { pdf, calls } = await capture(sale);
+    const pages = pageCount(pdf);
+    pagesFor[count] = pages;
+    // Business header appears on every page.
+    const headerPages = new Set(calls.filter((call) => call.text === "Test Business").map((call) => call.page));
+    assert.equal(headerPages.size, pages, `${count} items: header must repeat on all ${pages} pages`);
+    // Item-table heading repeats on every page that contains item rows.
+    const tableHeaderPages = new Set(calls.filter((call) => call.text === "ITEM / PRODUCT CODE").map((call) => call.page));
+    const itemRowPages = new Set(calls.filter((call) => call.text.startsWith("Long product ")).map((call) => call.page));
+    for (const page of itemRowPages) {
+      assert.ok(tableHeaderPages.has(page), `${count} items: item rows on a page without a table heading`);
+    }
+    // Page numbers are dynamic on every page.
+    for (let page = 1; page <= pages; page += 1) {
+      assert.ok(calls.some((call) => call.text === `Page ${page} of ${pages}`), `${count} items: missing "Page ${page} of ${pages}"`);
+    }
+    // No content collides with the reserved footer band.
+    const footerTexts = calls.filter((call) => /^Page \d+ of \d+$/.test(call.text) || call.text.startsWith("Contact:"));
+    const contentCalls = calls.filter((call) => !footerTexts.includes(call));
+    assert.ok(contentCalls.every((call) => call.end <= call.page.height - 55), `${count} items: content must stay above the footer band`);
+    // Terms stay together on one page and appear exactly once.
+    const termCalls = calls.filter((call) => /^\d+\. Test term/.test(call.text));
+    assert.equal(termCalls.length, 2, `${count} items: terms must appear exactly once`);
+    assert.equal(new Set(termCalls.map((call) => call.page)).size, 1, `${count} items: terms must not split across pages`);
+    // Totals always present on the final layout.
+    assert.ok(calls.some((call) => call.text === "Grand total"), `${count} items: missing grand total`);
+  }
+  assert.equal(pagesFor[1], 1);
+  assert.equal(pagesFor[5], 1);
+  assert.ok(pagesFor[30] >= 2, "30 long items must flow onto multiple pages");
+  assert.ok(pagesFor[80] > pagesFor[30], "page count must grow with content");
 });
 
 test("A4 long business and customer names do not overlap profile details", async () => {
@@ -298,7 +348,7 @@ test("legacy zero-default subtotal falls back to saved sale total and recorded a
 test("PDF invoice formats fit square, landscape, and portrait logos without stretching", async () => {
   const originalImage = PDFDocument.prototype.image;
   const cases = [
-    { width: 40, height: 40, format: "a4", fit: [54, 48] },
+    { width: 40, height: 40, format: "a4", fit: [74, 60] },
     { width: 80, height: 32, format: "thermal80", fit: [180.77, 28] },
     { width: 32, height: 80, format: "thermal58", fit: [126.41, 24] },
   ];

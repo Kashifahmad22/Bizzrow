@@ -18,6 +18,34 @@ const escapeHtml = (value) => String(value == null ? "" : value)
   .replace(/"/g, "&quot;")
   .replace(/'/g, "&#39;");
 
+const round2 = (value) => Math.round((Number(value) || 0) * 100) / 100;
+
+// Mirrors server/utils/invoiceTax.js: GST is EXTRACTED from GST-inclusive
+// amounts using per-item gstPct snapshots — never added on top of the total.
+function gstSummary(invoice) {
+  const items = Array.isArray(invoice.items) ? invoice.items : [];
+  if (!items.some((item) => item && item.gstPct != null && Number(item.gstPct) > 0)) return null;
+  const itemsSubtotal = items.reduce((sum, item) => sum + (Number(item?.subtotal) || 0), 0);
+  const billDiscount = Math.min(Number(invoice.billDiscountAmount) || 0, itemsSubtotal);
+  const groups = new Map();
+  for (const item of items) {
+    const rate = item && item.gstPct != null && Number.isFinite(Number(item.gstPct)) ? Number(item.gstPct) : 0;
+    const net = Number(item?.subtotal) || 0;
+    const share = itemsSubtotal > 0 ? net - (billDiscount * net) / itemsSubtotal : net;
+    groups.set(rate, (groups.get(rate) || 0) + share);
+  }
+  const rates = [];
+  let totalGst = 0;
+  for (const rate of [...groups.keys()].sort((a, b) => a - b)) {
+    const inclusive = round2(groups.get(rate));
+    if (inclusive <= 0 || rate <= 0) continue;
+    const gstAmount = round2((inclusive * rate) / (100 + rate));
+    rates.push({ rate, taxable: round2(inclusive - gstAmount), gstAmount });
+    totalGst = round2(totalGst + gstAmount);
+  }
+  return rates.length ? { rates, totalGst } : null;
+}
+
 function invoiceRows(invoice) {
   const rows = [
     ["Items subtotal", amount(Number(invoice.subtotal) || Number(invoice.total)), ""],
@@ -42,6 +70,15 @@ function invoiceRows(invoice) {
     for (const entry of savedTaxes) {
       rows.push([entry.label || entry.name || "Tax", amount(entry.amount ?? entry.taxAmount), "tax"]);
     }
+  }
+  const gst = gstSummary(invoice);
+  if (gst) {
+    rows.push(["GST SUMMARY (INCLUDED IN PRICES)", "", "tax-header"]);
+    for (const entry of gst.rates) {
+      rows.push([`Taxable value @ ${entry.rate}%`, amount(entry.taxable), "tax"]);
+      rows.push([`GST @ ${entry.rate}% (included)`, amount(entry.gstAmount), "tax"]);
+    }
+    rows.push(["Total GST included", amount(gst.totalGst), "tax-total"]);
   }
   rows.push(["Grand total", amount(invoice.total), "grand"]);
   for (const payment of invoice.payments || []) {
@@ -151,21 +188,9 @@ export function buildInvoicePrintHtml(invoice, format = "a4") {
   const itemContent = thermal
     ? `<section class="thermal-items">${itemRows || "<p>No item details recorded.</p>"}</section>`
     : `<table><thead><tr><th>#</th><th>Item / product code</th><th class="numeric">Qty</th><th>Unit</th><th class="numeric">Rate</th><th class="numeric">Disc.</th><th class="numeric">Line total</th></tr></thead><tbody>${itemRows}</tbody></table>`;
-  const printScript = thermal
-    ? 'window.addEventListener("load",()=>setTimeout(()=>window.print(),300));'
-    : `window.addEventListener("load",()=>setTimeout(()=>{
-      const invoice=document.querySelector(".invoice-content");
-      const limit=document.createElement("div");
-      limit.style.cssText="position:absolute;height:277mm;visibility:hidden;left:-10000px";
-      document.body.appendChild(limit);
-      const printableHeight=limit.getBoundingClientRect().height;
-      limit.remove();
-      if(invoice.getBoundingClientRect().height>printableHeight-2){
-        document.body.innerHTML="<main role=\\"alert\\" style=\\"font:16px Arial,sans-serif;padding:24px\\">This invoice is too long to print on one A4 page. Reduce the number or length of invoice items or terms and try again.</main>";
-        return;
-      }
-      window.print();
-    },300));`;
+  // Multi-page A4 printing is handled by CSS: thead repeats via
+  // table-header-group, and rows/summary/terms/footer avoid page breaks.
+  const printScript = 'window.addEventListener("load",()=>setTimeout(()=>window.print(),300));';
   const style = thermal ? `
     @page { size: ${width} auto; margin: 3mm; }
     body { width: ${format === "thermal58" ? "52mm" : "74mm"}; margin: 0 auto; font: ${format === "thermal58" ? "10px" : "11px"} Arial, sans-serif; color: #202438; }
@@ -188,7 +213,7 @@ export function buildInvoicePrintHtml(invoice, format = "a4") {
   ` : `
     @page { size: A4 portrait; margin: 10mm; }
     body { margin: 0; font: 9pt Arial, sans-serif; color: #202438; } .brand { display: flex; gap: 8px; align-items: flex-start; }
-    .logo { width: 19mm; height: 19mm; object-fit: contain; object-position: center; background: #fff; flex: 0 0 auto; } h1 { font-size: 18pt; margin: 0 0 2mm; }
+    .logo { width: 26mm; height: 26mm; object-fit: contain; object-position: center; background: #fff; flex: 0 0 auto; } h1 { font-size: 18pt; margin: 0 0 2mm; }
     .contact { color: #596176; font-size: 7.5pt; line-height: 1.25; overflow-wrap: anywhere; }
     .doc-title { margin-left: auto; font-size: 18pt; font-weight: bold; color: #3849f5; text-align: right; }
     .parties { display: flex; justify-content: space-between; gap: 10mm; border-top: 1px solid #dfe3ed; border-bottom: 1px solid #dfe3ed; margin: 3mm 0 2mm; padding: 1.5mm 0; }
@@ -199,7 +224,7 @@ export function buildInvoicePrintHtml(invoice, format = "a4") {
     .invoice-bottom { display: grid; grid-template-columns: minmax(0, 1fr) minmax(72mm, 88mm); gap: 8mm; align-items: start; margin-top: 2mm; }
     .summary { min-width: 0; margin: 0; } .summary-row { display: flex; justify-content: space-between; gap: 4mm; padding: .65mm 0; font-size: 7.5pt; }
     .summary-row strong { text-align: right; white-space: nowrap; } .grand { font-size: 9.5pt; font-weight: bold; border-top: 1px solid #687087; margin-top: .5mm; padding-top: 1mm; }
-    .tax-header { border-top: 1px solid #dfe3ed; padding-top: 1mm; margin-top: 1mm; color: #687087; font-size: 6.5pt; font-weight: bold; letter-spacing: .04em; } .tax { color: #687087; font-size: 7pt; }
+    .tax-header { border-top: 1px solid #dfe3ed; padding-top: 1mm; margin-top: 1mm; color: #687087; font-size: 6.5pt; font-weight: bold; letter-spacing: .04em; } .tax { color: #687087; font-size: 7pt; } .tax-total { color: #687087; font-size: 7pt; font-weight: bold; }
     .bank-details { min-width: 0; margin: 0; padding: 1mm 0 0; break-inside: avoid; } .bank-details h2 { margin: 0 0 1.5mm; } .bank-details dl { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 1.5mm 4mm; margin: 0; } .bank-details dl > div { display: flex; flex-wrap: wrap; gap: 1mm; min-width: 0; overflow-wrap: anywhere; font-size: 7pt; } .bank-details dt { color: #687087; font-size: 6.5pt; } .bank-details dd { margin: 0; overflow-wrap: anywhere; }
     .positive { color: #176f40; } .due { font-weight: bold; color: #a22; }
     .terms { margin-top: 2mm; font-size: 6.8pt; line-height: 1.2; } .terms h2 { font-size: 7pt; } .terms ol { margin: 1mm 0 0; padding-left: 4mm; } .terms li { margin: .5mm 0; break-inside: avoid; }
