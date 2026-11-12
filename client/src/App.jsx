@@ -1,23 +1,34 @@
+import { lazy, Suspense } from "react";
 import { Routes, Route, Navigate } from "react-router-dom";
 import { Analytics } from "@vercel/analytics/react";
 import { useAuth } from "./context/AuthContext.jsx";
 import AppShell from "./components/AppShell.jsx";
 
-import Landing from "./pages/Landing.jsx";
-import Privacy from "./pages/Privacy.jsx";
-import Terms from "./pages/Terms.jsx";
-import Login from "./pages/Login.jsx";
-import Register from "./pages/Register.jsx";
-import ForgotPassword from "./pages/ForgotPassword.jsx";
-import ResetPassword from "./pages/ResetPassword.jsx";
-import Dashboard from "./pages/Dashboard.jsx";
-import Products from "./pages/Products.jsx";
-import Ledger from "./pages/Ledger.jsx";
-import Sales from "./pages/Sales.jsx";
-import AIInsights from "./pages/AIInsights.jsx";
-import WhatsAppPage from "./pages/WhatsApp.jsx";
-import Settings from "./pages/Settings.jsx";
-import InventoryAudits from "./pages/InventoryAudits.jsx";
+// Route-level code splitting: each page loads on demand so the initial bundle
+// stays small (heavy dependencies like recharts only ship with their pages).
+const Landing = lazy(() => import("./pages/Landing.jsx"));
+const Privacy = lazy(() => import("./pages/Privacy.jsx"));
+const Terms = lazy(() => import("./pages/Terms.jsx"));
+const Login = lazy(() => import("./pages/Login.jsx"));
+const Register = lazy(() => import("./pages/Register.jsx"));
+const ForgotPassword = lazy(() => import("./pages/ForgotPassword.jsx"));
+const ResetPassword = lazy(() => import("./pages/ResetPassword.jsx"));
+const Dashboard = lazy(() => import("./pages/Dashboard.jsx"));
+const Products = lazy(() => import("./pages/Products.jsx"));
+const Ledger = lazy(() => import("./pages/Ledger.jsx"));
+const Sales = lazy(() => import("./pages/Sales.jsx"));
+const AIInsights = lazy(() => import("./pages/AIInsights.jsx"));
+const WhatsAppPage = lazy(() => import("./pages/WhatsApp.jsx"));
+const Settings = lazy(() => import("./pages/Settings.jsx"));
+const InventoryAudits = lazy(() => import("./pages/InventoryAudits.jsx"));
+
+function RouteFallback() {
+  return (
+    <div className="h-screen flex items-center justify-center bg-bg">
+      <div className="w-10 h-10 rounded-full border-2 border-brand-500 border-t-transparent animate-spin" />
+    </div>
+  );
+}
 
 function Protected({ children }) {
   const { user, loading } = useAuth();
@@ -42,7 +53,8 @@ function PublicOnly({ children }) {
 export default function App() {
   return (
     <>
-      <Routes>
+      <Suspense fallback={<RouteFallback />}>
+        <Routes>
         {/* Public marketing site */}
         <Route path="/" element={<Landing />} />
         <Route path="/privacy" element={<Privacy />} />
@@ -78,7 +90,8 @@ export default function App() {
 
         {/* Anything else → marketing home */}
         <Route path="*" element={<Navigate to="/" replace />} />
-      </Routes>
+        </Routes>
+      </Suspense>
       <Analytics />
     </>
   );

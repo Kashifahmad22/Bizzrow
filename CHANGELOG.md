@@ -1,5 +1,23 @@
 # Bizzrow — Changelog
 
+## v1.2 — Product Search, Loading Performance & UX Sprint
+
+### Product search & loading (P0)
+- **`fields=lite` projection** on `GET /api/products`: omits base64 `image` payloads for the sales product picker and replacement flow (previously up to ~1.5 MB per product × 50 per page); pricing/stock fields unchanged.
+- **Client-side search cache** (`client/src/lib/productCache.js`): 30 s TTL, bounded size, version-based invalidation — repeated queries respond instantly. Cache is invalidated on product create/edit/delete, stock adjustment, batch receipt, OCR import commit, Tatkal creation, recorded sale, return/replacement and inventory-audit approval. Display-only: sale pricing and stock deduction remain server-authoritative inside the financial transaction.
+- **Refresh button** inside the product search bars (Sales picker and Products page): invalidates the cache and force-fetches the current query, keeps the search text, shows a spinning indicator, blocks duplicate refreshes, and reports errors via toast.
+- Existing debounce, request cancellation, stale-response protection, pagination and tenant scoping retained.
+
+### App loading performance
+- **Route-level code splitting** (React.lazy/Suspense): initial JS reduced from a single 1,057.7 kB chunk (303.5 kB gzip) to a 374.8 kB entry (125.3 kB gzip); recharts now loads only with Dashboard/AI pages. In-app page transitions suspend inside the shell so navigation stays visible.
+
+### UI/UX
+- Inventory Audits: status pills (draft/completed) and colour-coded discrepancy badges — Match (green), Shortage (red), Surplus (amber).
+- Product cards: edit/delete actions always visible on touch devices (previously hover-only), larger touch targets, SKU shown on the card.
+
+### Tests
+- Server 182/182 (incl. financial/Tatkal/audit integration on a disposable Docker replica set), client unit 27/27 (new product-cache tests), browser e2e 21/21. Product search test now also covers the lite projection.
+
 ## v1.1 — Pricing Engine Standardization & Tatkal Product Addition
 
 ### Official pricing rules (enforced server-side in `server/utils/productPricing.js`)
