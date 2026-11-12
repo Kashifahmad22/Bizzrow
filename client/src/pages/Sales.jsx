@@ -358,6 +358,8 @@ function NewSaleModal({ onClose, onCreated }) {
   const [step, setStep] = useState(1); // 1: customer, 2: items, 3: payment
   const [customers, setCustomers] = useState([]);
   const [products, setProducts] = useState([]);
+  const [productSearchComplete, setProductSearchComplete] = useState(false);
+  const [tatkalOpen, setTatkalOpen] = useState(false);
   const [productPage, setProductPage] = useState(1);
   const [hasMoreProducts, setHasMoreProducts] = useState(false);
   const [loadingMoreProducts, setLoadingMoreProducts] = useState(false);
@@ -376,6 +378,7 @@ function NewSaleModal({ onClose, onCreated }) {
 
   const debouncedQ = useDebounce(q, 250);
   const debouncedPq = useDebounce(pq, 150);
+  const productResultsCurrent = productSearchComplete && pq.trim() === debouncedPq.trim();
 
   // Customer search (Feature 4) — debounced, server-backed.
   useEffect(() => {
@@ -395,6 +398,7 @@ function NewSaleModal({ onClose, onCreated }) {
   // Product search (Feature 3) — debounced, server-backed; only in-stock items are sellable.
   useEffect(() => {
     const request = productRequests.current.start();
+    setProductSearchComplete(false);
     setLoadingMoreProducts(false);
     (async () => {
       try {
@@ -402,7 +406,8 @@ function NewSaleModal({ onClose, onCreated }) {
         if (debouncedPq.trim()) params.q = debouncedPq.trim();
         const { data } = await api.get("/products", { params, signal: request.signal });
         if (!request.isCurrent()) return;
-        setProducts(data.products.filter((x) => x.stock > 0));
+        setProducts(data.products);
+        setProductSearchComplete(true);
         setProductPage(data.page || 1);
         setHasMoreProducts((data.page || 1) < (data.pages || 1));
       } catch (err) {
@@ -421,7 +426,7 @@ function NewSaleModal({ onClose, onCreated }) {
       if (debouncedPq.trim()) params.q = debouncedPq.trim();
       const { data } = await api.get("/products", { params, signal: request.signal });
       if (!request.isCurrent()) return;
-      setProducts((prev) => [...prev, ...data.products.filter((product) => product.stock > 0)]);
+      setProducts((prev) => [...prev, ...data.products]);
       setProductPage(data.page || nextPage);
       setHasMoreProducts((data.page || nextPage) < (data.pages || 1));
     } catch (err) {
@@ -779,19 +784,27 @@ function NewSaleModal({ onClose, onCreated }) {
                   <input className="flex-1 outline-none bg-transparent text-sm" placeholder="Search name or SKU…" value={pq} onChange={(e) => {
                     productRequests.current.cancel();
                     setLoadingMoreProducts(false);
+                    setProductSearchComplete(false);
+                    setTatkalOpen(false);
                     setPq(e.target.value);
                   }} />
                 </div>
                 <div className="space-y-1 max-h-[28rem] overflow-y-auto">
-                  {products.length === 0 && <p className="text-sm text-ink-500 text-center py-6">No in-stock products match.</p>}
-                  {products.map((p) => (
-                    <button key={p._id} onClick={() => addItem(p)} className="w-full flex items-center gap-3 px-3 py-2 rounded-xl hover:bg-ink-50 text-left">
+                  {products.length === 0 && productResultsCurrent && <div className="text-sm text-ink-500 text-center py-6">
+                    <p>No in-stock products match.</p>
+                    {pq.trim() && <>
+                      <p className="mt-1">No products match this search.</p>
+                      <button type="button" className="btn-outline mt-3" onClick={() => setTatkalOpen(true)}>Add Product</button>
+                    </>}
+                  </div>}
+                  {productResultsCurrent && products.map((p) => (
+                    <button key={p._id} disabled={!(p.stock > 0)} onClick={() => addItem(p)} className="w-full flex items-center gap-3 px-3 py-2 rounded-xl hover:bg-ink-50 text-left disabled:opacity-60">
                       <div className="w-9 h-9 rounded-lg bg-brand-500/10 text-brand-500 flex items-center justify-center text-xs font-bold shrink-0 overflow-hidden">
                         {p.image ? <img src={p.image} alt="" className="w-full h-full object-cover" /> : p.name.slice(0, 2).toUpperCase()}
                       </div>
                       <div className="flex-1 min-w-0">
                         <div className="font-semibold text-sm text-ink-800 truncate">{p.name}</div>
-                        <div className="text-xs text-ink-500">{[p.sku, p.color, p.size].filter(Boolean).join(" · ")} · {p.stock} in stock</div>
+                        <div className="text-xs text-ink-500">{[p.sku, p.color, p.size].filter(Boolean).join(" · ")} · {p.stock > 0 ? `${p.stock} in stock` : "Out of stock"}</div>
                         <div className="text-[11px] text-ink-400">
                           Wholesale {formatINR(round2(p.wholesalePrice ?? p.sellingPrice))} · Retail {formatINR(round2(p.retailPrice ?? ((p.wholesalePrice ?? p.sellingPrice) * 2)))}
                         </div>
@@ -802,6 +815,19 @@ function NewSaleModal({ onClose, onCreated }) {
                       </div>
                     </button>
                   ))}
+                  {tatkalOpen && (
+                    <TatkalProductForm
+                      initialName={pq.trim()}
+                      onCancel={() => setTatkalOpen(false)}
+                      onCreated={(product) => {
+                        setProducts((previous) => [product, ...previous.filter((entry) => entry._id !== product._id)]);
+                        setProductSearchComplete(true);
+                        setTatkalOpen(false);
+                        addItem(product);
+                        toast.success("Product created and added to this bill");
+                      }}
+                    />
+                  )}
                 </div>
                 {hasMoreProducts && pq.trim() === debouncedPq.trim() && (
                   <button
@@ -1268,6 +1294,93 @@ function InvoiceModal({ invoice, onClose, onChanged }) {
       />
     )}
     </>
+  );
+}
+
+function TatkalProductForm({ initialName, onCancel, onCreated }) {
+  const [form, setForm] = useState({ name: initialName, openingStock: "1", sellingPrice: "" });
+  const [submitting, setSubmitting] = useState(false);
+  const [retryPending, setRetryPending] = useState(false);
+  const [error, setError] = useState("");
+  const requestRef = useRef(null);
+  const submittingRef = useRef(false);
+
+  const sendRequest = async () => {
+    if (submittingRef.current || !requestRef.current) return;
+    submittingRef.current = true;
+    setSubmitting(true);
+    setError("");
+    try {
+      const { body, key } = requestRef.current;
+      const { data } = await api.post("/products", body, { headers: { "Idempotency-Key": key } });
+      requestRef.current = null;
+      onCreated(data.product);
+    } catch (requestError) {
+      const status = requestError.response?.status;
+      if (status >= 400 && status < 500) {
+        requestRef.current = null;
+        setRetryPending(false);
+      } else setRetryPending(true);
+      setError(requestError.message || "Product creation failed");
+    } finally {
+      submittingRef.current = false;
+      setSubmitting(false);
+    }
+  };
+
+  const submit = (event) => {
+    event.preventDefault();
+    if (!form.name.trim() || !/^\d+(?:\.\d{1,3})?$/.test(form.openingStock)
+        || Number(form.openingStock) <= 0 || !/^\d+(?:\.\d{1,2})?$/.test(form.sellingPrice)
+        || Number(form.sellingPrice) <= 0) {
+      setError("Enter a product name, positive opening stock, and selling price.");
+      return;
+    }
+    if (!requestRef.current) {
+      if (!window.crypto?.randomUUID) {
+        setError("Secure transaction keys are unavailable in this browser.");
+        return;
+      }
+      requestRef.current = {
+        key: window.crypto.randomUUID(),
+        body: {
+          tatkal: true,
+          name: form.name.trim(),
+          quantity: Number(form.openingStock),
+          sellingPrice: Number(form.sellingPrice),
+        },
+      };
+    }
+    sendRequest();
+  };
+
+  return (
+    <form onSubmit={submit} className="card !p-3 mt-3 space-y-3">
+      <div className="flex items-center justify-between gap-2">
+        <h4 className="font-semibold">Add Product to this sale</h4>
+        <button type="button" className="text-sm underline" disabled={submitting || retryPending} onClick={onCancel}>Cancel</button>
+      </div>
+      <p className="text-xs text-ink-500">Opening stock is added to inventory. The product is added to this bill once; cost and margin stay unconfigured.</p>
+      <label className="block text-xs text-ink-500">Product name
+        <input className="input mt-1" maxLength={160} required value={form.name} disabled={retryPending}
+          onChange={(event) => setForm((current) => ({ ...current, name: event.target.value }))} />
+      </label>
+      <div className="grid grid-cols-2 gap-2">
+        <label className="block text-xs text-ink-500">Opening stock quantity
+          <input className="input mt-1" type="number" min="0.001" step="0.001" required value={form.openingStock} disabled={retryPending}
+            onChange={(event) => setForm((current) => ({ ...current, openingStock: event.target.value }))} />
+        </label>
+        <label className="block text-xs text-ink-500">Selling price
+          <input className="input mt-1" type="number" min="0.01" step="0.01" required value={form.sellingPrice} disabled={retryPending}
+            onChange={(event) => setForm((current) => ({ ...current, sellingPrice: event.target.value }))} />
+        </label>
+      </div>
+      {retryPending && <p className="text-xs text-amber-700">The request may have succeeded. Retry with the same details to avoid creating a duplicate.</p>}
+      {error && <p role="alert" className="text-sm text-rose-600">{error}</p>}
+      {retryPending
+        ? <button type="button" className="btn-primary w-full" disabled={submitting} onClick={sendRequest}>Retry product creation</button>
+        : <button className="btn-primary w-full" type="submit" disabled={submitting}>{submitting ? "Creating…" : "Create and add to bill"}</button>}
+    </form>
   );
 }
 

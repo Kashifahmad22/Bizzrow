@@ -18,6 +18,7 @@ const { adjustStock } = require("../services/stockAdjustment");
 const { validateNewQuantity } = require("../utils/quantity");
 const {
   executeIdempotently,
+  requestFingerprint,
   requireIdempotencyKey,
   resourceIdempotency,
   runFinancialTransaction,
@@ -195,6 +196,64 @@ router.post(
 router.post(
   "/",
   asyncHandler(async (req, res) => {
+    if (req.body?.tatkal === true) {
+      const allowedFields = new Set(["tatkal", "name", "sku", "quantity", "sellingPrice"]);
+      if (!req.body || typeof req.body !== "object" || Array.isArray(req.body)
+          || Object.keys(req.body).some((field) => !allowedFields.has(field))
+          || typeof req.body.name !== "string" || !req.body.name.trim() || req.body.name.trim().length > 160
+          || (req.body.sku !== undefined
+            && (typeof req.body.sku !== "string" || req.body.sku.trim().length > 160))) {
+        throw Object.assign(new Error("Enter a product name, opening stock quantity, and selling price only"), { status: 400 });
+      }
+
+      const openingStock = validateNewQuantity(req.body.quantity);
+      const sellingPrice = validateCurrency(req.body.sellingPrice, "sellingPrice");
+      if (sellingPrice <= 0) {
+        throw Object.assign(new Error("Selling price must be greater than zero"), { status: 400 });
+      }
+      const key = requireIdempotencyKey(req);
+      const payload = {
+        owner: req.user._id,
+        name: req.body.name.trim(),
+        sku: (req.body.sku || "").trim(),
+        wholesalePrice: sellingPrice,
+        retailPrice: sellingPrice,
+        sellingPrice,
+        costPrice: null,
+        marginPct: null,
+        stock: openingStock,
+      };
+      const result = await executeIdempotently({
+        ownerId: req.user._id,
+        operation: "product-tatkal-create",
+        key,
+        fingerprint: requestFingerprint("product:tatkal-create", {}, req.body),
+        work: async (session) => {
+          const [product] = await Product.create([payload], { session });
+          return {
+            resultType: "product-tatkal-create",
+            resultId: product._id,
+            value: { product: serializeProduct(product) },
+          };
+        },
+        replay: async (record) => {
+          const product = await Product.findOne({ _id: record.resultId, owner: req.user._id });
+          if (!product) throw new Error("Idempotent Tatkal creation references a missing product");
+          return { product: serializeProduct(product) };
+        },
+        replaySnapshot: async (snapshot) => {
+          const exists = await Product.exists({ _id: snapshot.product._id, owner: req.user._id });
+          if (!exists) {
+            throw Object.assign(new Error("The previously created product no longer exists; review the catalogue before creating another"), { status: 409 });
+          }
+          return snapshot;
+        },
+      });
+      return res.status(201).json(result);
+    }
+    if (req.body && Object.prototype.hasOwnProperty.call(req.body, "tatkal")) {
+      throw Object.assign(new Error("Invalid product creation mode"), { status: 400 });
+    }
     const { name, costPrice } = req.body;
     if (!name || (req.body.wholesalePrice == null && req.body.sellingPrice == null)) {
       res.status(400);
