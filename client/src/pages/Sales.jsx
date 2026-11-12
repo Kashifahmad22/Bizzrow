@@ -26,6 +26,7 @@ import { createLatestRequest } from "../lib/latestRequest.js";
 import { calculateCheckoutPayment } from "../lib/checkoutPayment.js";
 import { subtractQuantity, stepQuantity } from "../lib/quantity.js";
 import { multiplyRounded } from "../lib/money.js";
+import { defaultRetailPrice, gstBreakdown } from "../lib/pricing.js";
 import { estimateReturnRefund } from "../lib/returnMath.js";
 import PageHeader from "../components/PageHeader.jsx";
 import BusinessLogo from "../components/BusinessLogo.jsx";
@@ -1298,12 +1299,28 @@ function InvoiceModal({ invoice, onClose, onChanged }) {
 }
 
 function TatkalProductForm({ initialName, onCancel, onCreated }) {
-  const [form, setForm] = useState({ name: initialName, openingStock: "1", sellingPrice: "" });
+  const [form, setForm] = useState({ name: initialName, openingStock: "1", wholesalePrice: "", retailPrice: "", gstPct: "" });
+  const [retailEdited, setRetailEdited] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [retryPending, setRetryPending] = useState(false);
   const [error, setError] = useState("");
   const requestRef = useRef(null);
   const submittingRef = useRef(false);
+
+  const defaultRetail = defaultRetailPrice(form.wholesalePrice);
+  const retailIsManual = retailEdited && Number(form.retailPrice) !== defaultRetail;
+
+  const setWholesale = (value) => setForm((current) => ({
+    ...current,
+    wholesalePrice: value,
+    // Keep retail at the 2x default until the user edits it manually.
+    ...(retailIsManual ? {} : { retailPrice: value === "" ? "" : String(defaultRetailPrice(value)) }),
+  }));
+
+  const restoreDefaultRetail = () => {
+    setRetailEdited(false);
+    setForm((current) => ({ ...current, retailPrice: current.wholesalePrice === "" ? "" : String(defaultRetailPrice(current.wholesalePrice)) }));
+  };
 
   const sendRequest = async () => {
     if (submittingRef.current || !requestRef.current) return;
@@ -1330,10 +1347,12 @@ function TatkalProductForm({ initialName, onCancel, onCreated }) {
 
   const submit = (event) => {
     event.preventDefault();
+    const priceOk = (value) => /^\d+(?:\.\d{1,2})?$/.test(value) && Number(value) > 0;
     if (!form.name.trim() || !/^\d+(?:\.\d{1,3})?$/.test(form.openingStock)
-        || Number(form.openingStock) <= 0 || !/^\d+(?:\.\d{1,2})?$/.test(form.sellingPrice)
-        || Number(form.sellingPrice) <= 0) {
-      setError("Enter a product name, positive opening stock, and selling price.");
+        || Number(form.openingStock) <= 0 || !priceOk(form.wholesalePrice)
+        || !priceOk(form.retailPrice)
+        || (form.gstPct !== "" && !(Number(form.gstPct) >= 0 && Number(form.gstPct) <= 100))) {
+      setError("Enter a product name, positive opening stock, wholesale and retail prices (GST % between 0 and 100).");
       return;
     }
     if (!requestRef.current) {
@@ -1347,12 +1366,16 @@ function TatkalProductForm({ initialName, onCancel, onCreated }) {
           tatkal: true,
           name: form.name.trim(),
           quantity: Number(form.openingStock),
-          sellingPrice: Number(form.sellingPrice),
+          wholesalePrice: Number(form.wholesalePrice),
+          retailPrice: Number(form.retailPrice),
+          ...(form.gstPct !== "" ? { gstPct: Number(form.gstPct) } : {}),
         },
       };
     }
     sendRequest();
   };
+
+  const gst = gstBreakdown(form.wholesalePrice, form.gstPct);
 
   return (
     <form onSubmit={submit} className="card !p-3 mt-3 space-y-3">
@@ -1366,15 +1389,32 @@ function TatkalProductForm({ initialName, onCancel, onCreated }) {
           onChange={(event) => setForm((current) => ({ ...current, name: event.target.value }))} />
       </label>
       <div className="grid grid-cols-2 gap-2">
+        <label className="block text-xs text-ink-500">Wholesale price ₹ (incl. GST)
+          <input className="input mt-1" type="number" min="0.01" step="0.01" required value={form.wholesalePrice} disabled={retryPending}
+            onChange={(event) => setWholesale(event.target.value)} />
+        </label>
+        <label className="block text-xs text-ink-500">
+          <span className="flex items-center justify-between gap-1">
+            <span>Retail price ₹{retailIsManual ? " · manual" : " · 2× auto"}</span>
+            {retailIsManual && (
+              <button type="button" className="text-brand-600 underline" disabled={retryPending} onClick={restoreDefaultRetail}>Reset 2×</button>
+            )}
+          </span>
+          <input className="input mt-1" type="number" min="0.01" step="0.01" required value={form.retailPrice} disabled={retryPending}
+            onChange={(event) => { setRetailEdited(true); setForm((current) => ({ ...current, retailPrice: event.target.value })); }} />
+        </label>
         <label className="block text-xs text-ink-500">Opening stock quantity
           <input className="input mt-1" type="number" min="0.001" step="0.001" required value={form.openingStock} disabled={retryPending}
             onChange={(event) => setForm((current) => ({ ...current, openingStock: event.target.value }))} />
         </label>
-        <label className="block text-xs text-ink-500">Selling price
-          <input className="input mt-1" type="number" min="0.01" step="0.01" required value={form.sellingPrice} disabled={retryPending}
-            onChange={(event) => setForm((current) => ({ ...current, sellingPrice: event.target.value }))} />
+        <label className="block text-xs text-ink-500">GST % (optional)
+          <input className="input mt-1" type="number" min="0" max="100" step="0.01" placeholder="0" value={form.gstPct} disabled={retryPending}
+            onChange={(event) => setForm((current) => ({ ...current, gstPct: event.target.value }))} />
         </label>
       </div>
+      {gst.gstAmount > 0 && (
+        <p className="text-[11px] text-ink-500">Wholesale includes {formatINR(gst.gstAmount)} GST at {gst.gstPct}% (taxable {formatINR(gst.taxableValue)}). GST is never added on top.</p>
+      )}
       {retryPending && <p className="text-xs text-amber-700">The request may have succeeded. Retry with the same details to avoid creating a duplicate.</p>}
       {error && <p role="alert" className="text-sm text-rose-600">{error}</p>}
       {retryPending

@@ -18,6 +18,9 @@ const productSchema = new mongoose.Schema(
     costPrice: { type: Number, default: null, min: 0 },
     wholesalePrice: { type: Number, default: null, min: 0 },
     retailPrice: { type: Number, default: null, min: 0 },
+    // true = retail manually set; false = default 2x wholesale; null = legacy
+    // (unknown) — resolved with a conservative heuristic in utils/productPricing.
+    retailPriceOverridden: { type: Boolean, default: null },
     sellingPrice: { type: Number, required: true, min: 0 },
     stock: { type: Number, required: true, default: 0, min: 0 },
     stockRevision: { type: Number, default: 0 },

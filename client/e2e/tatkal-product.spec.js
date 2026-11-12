@@ -54,7 +54,8 @@ test("Tatkal product is created and sold in the current bill exactly once", asyn
   await modal.getByRole("button", { name: "Add Product" }).click();
   await modal.getByLabel("Product name").fill(productName);
   await modal.getByLabel("Opening stock quantity").fill("5");
-  await modal.getByLabel("Selling price").fill("20");
+  await modal.getByLabel("Wholesale price").fill("20");
+  await expect(modal.getByLabel("Retail price")).toHaveValue("40");
 
   const keys = [];
   await page.route(`${api}/products`, async (route) => {
@@ -76,7 +77,7 @@ test("Tatkal product is created and sold in the current bill exactly once", asyn
   const creationRequest = response.request();
   const creationBody = creationRequest.postDataJSON();
   const idempotencyKey = creationRequest.headers()["idempotency-key"];
-  expect(creationBody).toEqual({ tatkal: true, name: productName, quantity: 5, sellingPrice: 20 });
+  expect(creationBody).toEqual({ tatkal: true, name: productName, quantity: 5, wholesalePrice: 20, retailPrice: 40 });
   expect(idempotencyKey).toBeTruthy();
   expect(keys).toEqual([idempotencyKey, idempotencyKey]);
   const product = (await response.json()).product;
