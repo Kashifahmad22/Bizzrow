@@ -33,6 +33,12 @@ class ProductQuery {
     return this;
   }
 
+  // Mirrors the route's optional lite projection (fields=lite → "-image").
+  select(projection) {
+    this.projection = projection ?? null;
+    return this;
+  }
+
   skip(offset) {
     this.offset = offset;
     return this;
@@ -52,7 +58,12 @@ class ProductQuery {
       if (left > right) return direction;
       return 0;
     });
-    return Promise.resolve(products.slice(this.offset, this.offset + this.pageSize)).then(resolve, reject);
+    const page = products.slice(this.offset, this.offset + this.pageSize).map((entry) => {
+      if (this.projection !== "-image") return entry;
+      const { image, ...lite } = entry;
+      return lite;
+    });
+    return Promise.resolve(page).then(resolve, reject);
   }
 }
 
@@ -72,6 +83,7 @@ function product({ id, owner, name, sku = "", barcode = "", createdAt = new Date
     sellingPrice: 10,
     wholesalePrice: 10,
     retailPrice: 20,
+    image: "data:image/png;base64,stub",
     createdAt,
   };
 }
@@ -141,6 +153,14 @@ test("product search API preserves literal matching, tenant scope, and paginatio
   try {
     const lhs = await search({ q: "LHS" });
     assert.ok(lhs.products.some((entry) => entry._id === "lhs-20"));
+    assert.ok(lhs.products.every((entry) => entry.image === "data:image/png;base64,stub"));
+
+    // fields=lite keeps search payloads small by omitting base64 images while
+    // preserving pricing and stock details.
+    const lite = await search({ q: "LHS", fields: "lite" });
+    assert.ok(lite.products.length > 0);
+    assert.ok(lite.products.every((entry) => entry.image === undefined));
+    assert.ok(lite.products.every((entry) => entry.wholesalePrice === 10 && entry.retailPrice === 20 && entry.stock === 1));
 
     const lhsTwo = await search({ q: "LHS 2" });
     assert.deepEqual(lhsTwo.products.map((entry) => entry._id).sort(), [

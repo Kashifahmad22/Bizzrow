@@ -1,4 +1,5 @@
 import { Outlet, NavLink, useNavigate } from "react-router-dom";
+import { Suspense } from "react";
 import { motion } from "framer-motion";
 import {
   LayoutDashboard,
@@ -81,7 +82,16 @@ export default function AppShell() {
         </header>
 
         <main className="flex-1 px-4 lg:px-8 py-6 pb-28 lg:pb-8 max-w-6xl mx-auto w-full">
-          <Outlet />
+          {/* Lazy routed pages suspend here so the shell and nav stay visible. */}
+          <Suspense
+            fallback={
+              <div className="flex items-center justify-center py-24">
+                <div className="w-8 h-8 rounded-full border-2 border-brand-500 border-t-transparent animate-spin" />
+              </div>
+            }
+          >
+            <Outlet />
+          </Suspense>
         </main>
 
         {/* Mobile bottom nav */}

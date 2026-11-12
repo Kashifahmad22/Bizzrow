@@ -104,8 +104,11 @@ router.get(
 
     const page = clampPage(req.query.page);
     const limit = clampLimit(req.query.limit, 24, 200);
+    // fields=lite drops the base64 image payload — used by the sales product
+    // picker where thumbnails are optional and search latency matters.
+    const projection = req.query.fields === "lite" ? "-image" : null;
     const [products, total] = await Promise.all([
-      Product.find(filter).sort(sortSpec).skip((page - 1) * limit).limit(limit),
+      Product.find(filter).select(projection).sort(sortSpec).skip((page - 1) * limit).limit(limit),
       Product.countDocuments(filter),
     ]);
     res.json({ products: products.map(serializeProduct), ...pageMeta(total, page, limit) });

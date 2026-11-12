@@ -27,6 +27,7 @@ import { calculateCheckoutPayment } from "../lib/checkoutPayment.js";
 import { subtractQuantity, stepQuantity } from "../lib/quantity.js";
 import { multiplyRounded } from "../lib/money.js";
 import { defaultRetailPrice, gstBreakdown } from "../lib/pricing.js";
+import { productCacheKey, getCachedProducts, setCachedProducts, invalidateProductCache } from "../lib/productCache.js";
 import { estimateReturnRefund } from "../lib/returnMath.js";
 import PageHeader from "../components/PageHeader.jsx";
 import BusinessLogo from "../components/BusinessLogo.jsx";
@@ -397,33 +398,65 @@ function NewSaleModal({ onClose, onCreated }) {
   }, [debouncedQ]);
 
   // Product search (Feature 3) — debounced, server-backed; only in-stock items are sellable.
-  useEffect(() => {
+  // Responses use fields=lite (no base64 images) and a short-TTL cache so
+  // repeated queries respond instantly; pricing stays server-authoritative.
+  const [refreshingProducts, setRefreshingProducts] = useState(false);
+
+  const fetchProducts = useCallback(async (query, { bypassCache = false } = {}) => {
     const request = productRequests.current.start();
     setProductSearchComplete(false);
     setLoadingMoreProducts(false);
-    (async () => {
-      try {
-        const params = { limit: 50, page: 1 };
-        if (debouncedPq.trim()) params.q = debouncedPq.trim();
-        const { data } = await api.get("/products", { params, signal: request.signal });
-        if (!request.isCurrent()) return;
-        setProducts(data.products);
-        setProductSearchComplete(true);
-        setProductPage(data.page || 1);
-        setHasMoreProducts((data.page || 1) < (data.pages || 1));
-      } catch (err) {
-        if (request.isCurrent()) toast.error(err.message);
-      }
-    })();
+    const params = { limit: 50, page: 1, fields: "lite" };
+    if (query) params.q = query;
+    const key = productCacheKey(params);
+    const cached = bypassCache ? null : getCachedProducts(key);
+    if (cached) {
+      setProducts(cached.products);
+      setProductSearchComplete(true);
+      setProductPage(cached.page || 1);
+      setHasMoreProducts((cached.page || 1) < (cached.pages || 1));
+      return true;
+    }
+    try {
+      const { data } = await api.get("/products", { params, signal: request.signal });
+      if (!request.isCurrent()) return false;
+      setCachedProducts(key, data);
+      setProducts(data.products);
+      setProductSearchComplete(true);
+      setProductPage(data.page || 1);
+      setHasMoreProducts((data.page || 1) < (data.pages || 1));
+      return true;
+    } catch (err) {
+      if (request.isCurrent()) toast.error(err.message);
+      return false;
+    }
+  }, []);
+
+  useEffect(() => {
+    fetchProducts(debouncedPq.trim());
     return () => productRequests.current.cancel();
-  }, [debouncedPq]);
+  }, [debouncedPq, fetchProducts]);
+
+  // Manual refresh: invalidate the cache and force a fresh fetch for the
+  // current query. Never reloads the page or clears the search input.
+  const refreshProducts = async () => {
+    if (refreshingProducts) return;
+    setRefreshingProducts(true);
+    invalidateProductCache();
+    try {
+      const ok = await fetchProducts(debouncedPq.trim(), { bypassCache: true });
+      if (ok) toast.success("Products refreshed");
+    } finally {
+      setRefreshingProducts(false);
+    }
+  };
 
   const loadMoreProducts = async () => {
     const request = productRequests.current.start();
     const nextPage = productPage + 1;
     setLoadingMoreProducts(true);
     try {
-      const params = { limit: 50, page: nextPage };
+      const params = { limit: 50, page: nextPage, fields: "lite" };
       if (debouncedPq.trim()) params.q = debouncedPq.trim();
       const { data } = await api.get("/products", { params, signal: request.signal });
       if (!request.isCurrent()) return;
@@ -589,6 +622,7 @@ function NewSaleModal({ onClose, onCreated }) {
       const response = await financialMutation.submit(payload);
       if (!response) return;
       const { data } = response;
+      invalidateProductCache();
       toast.success("Sale recorded");
       onCreated(data.sale);
     } catch (err) {
@@ -789,6 +823,16 @@ function NewSaleModal({ onClose, onCreated }) {
                     setTatkalOpen(false);
                     setPq(e.target.value);
                   }} />
+                  <button
+                    type="button"
+                    title="Refresh products"
+                    aria-label="Refresh products"
+                    className="p-1.5 rounded-lg text-ink-500 hover:text-brand-600 hover:bg-ink-50 disabled:opacity-50 shrink-0"
+                    disabled={refreshingProducts}
+                    onClick={refreshProducts}
+                  >
+                    <RefreshCw className={`w-4 h-4 ${refreshingProducts ? "animate-spin" : ""}`} />
+                  </button>
                 </div>
                 <div className="space-y-1 max-h-[28rem] overflow-y-auto">
                   {products.length === 0 && productResultsCurrent && <div className="text-sm text-ink-500 text-center py-6">
@@ -821,6 +865,7 @@ function NewSaleModal({ onClose, onCreated }) {
                       initialName={pq.trim()}
                       onCancel={() => setTatkalOpen(false)}
                       onCreated={(product) => {
+                        invalidateProductCache();
                         setProducts((previous) => [product, ...previous.filter((entry) => entry._id !== product._id)]);
                         setProductSearchComplete(true);
                         setTatkalOpen(false);
@@ -1455,7 +1500,7 @@ function ReplacementModal({ saleId, items, saleTotal, saleType = "wholesale", on
     setLoadingMoreProducts(false);
     (async () => {
       try {
-        const params = { limit: 30, page: 1 };
+        const params = { limit: 30, page: 1, fields: "lite" };
         if (dq.trim()) params.q = dq.trim();
         const { data } = await api.get("/products", { params, signal: request.signal });
         if (!request.isCurrent()) return;
@@ -1474,7 +1519,7 @@ function ReplacementModal({ saleId, items, saleTotal, saleType = "wholesale", on
     const nextPage = productPage + 1;
     setLoadingMoreProducts(true);
     try {
-      const params = { limit: 30, page: nextPage };
+      const params = { limit: 30, page: nextPage, fields: "lite" };
       if (dq.trim()) params.q = dq.trim();
       const { data } = await api.get("/products", { params, signal: request.signal });
       if (!request.isCurrent()) return;
@@ -1528,6 +1573,7 @@ function ReplacementModal({ saleId, items, saleTotal, saleType = "wholesale", on
       const response = await financialMutation.submit({ returnItems, newItems, payments });
       if (!response) return;
       const { data } = response;
+      invalidateProductCache();
       toast.success(`Replacement done · difference ${formatINR(data.priceDifference)}`);
       onDone();
     } catch (err) {
@@ -1662,6 +1708,7 @@ function ReturnModal({ saleId, items, saleTotal, onClose, onDone }) {
       const response = await financialMutation.submit({ items: payloadItems, reason, notes });
       if (!response) return;
       const { data } = response;
+      invalidateProductCache();
       toast.success(`Returned — ${formatINR(data.refund)} credited`);
       onDone();
     } catch (err) {

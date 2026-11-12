@@ -4,6 +4,7 @@ import api from "../api/client.js";
 import PageHeader from "../components/PageHeader.jsx";
 import { useFinancialMutation } from "../hooks/useFinancialMutation.js";
 import { subtractQuantity } from "../lib/quantity.js";
+import { invalidateProductCache } from "../lib/productCache.js";
 
 export default function InventoryAudits() {
   const [audits, setAudits] = useState([]);
@@ -94,6 +95,7 @@ export default function InventoryAudits() {
       if (!response) return;
       setAudit(response.data.audit);
       setReview(false);
+      invalidateProductCache();
       toast.success("Inventory audit completed");
       await loadList();
     } catch (error) { setMessage(error.message); }
@@ -123,15 +125,18 @@ export default function InventoryAudits() {
         <div className="card space-y-2">
           <h2 className="font-bold">Audit history</h2>
           {loading ? <p>Loading audits…</p> : audits.length === 0 ? <p>No audits yet.</p> : audits.map((entry) =>
-            <button key={entry._id} className="block w-full text-left border-b py-2" onClick={() => open(entry._id)}>
-              {entry.status} — {new Date(entry.createdAt).toLocaleString()}
+            <button key={entry._id} className="w-full text-left border-b py-2 flex items-center justify-between gap-2" onClick={() => open(entry._id)}>
+              <span>{new Date(entry.createdAt).toLocaleString()}</span>
+              <span className={entry.status === "completed" ? "pill-good" : entry.status === "draft" ? "pill-warn" : "pill-info"}>{entry.status}</span>
             </button>)}
         </div>
       </>}
       {audit && <>
         <div className="flex flex-wrap gap-2 mb-4">
           <button className="btn-outline" onClick={() => { setAudit(null); setReview(false); }}>Back to audits</button>
-          <span className="self-center font-semibold">Status: {audit.status}</span>
+          <span className="self-center font-semibold flex items-center gap-2">Status:{" "}
+            <span className={audit.status === "completed" ? "pill-good" : audit.status === "draft" ? "pill-warn" : "pill-info"}>{audit.status}</span>
+          </span>
         </div>
         <div className="space-y-4">
           {audit.items.map((item, i) => <section key={item.product} className="card space-y-3">
@@ -149,7 +154,15 @@ export default function InventoryAudits() {
                   <input className="input mt-1" type="number" step="any" min="0" disabled={audit.status !== "draft" || review || approval.pending}
                     value={source.physicalQuantity ?? ""} onChange={(event) => updateSource(i, j, "physicalQuantity", event.target.value)} />
                 </label>
-                <p>Difference: {difference == null ? "—" : `${difference > 0 ? "Surplus " : difference < 0 ? "Shortage " : "Match "}${difference}`}</p>
+                <p className="flex items-center gap-2">Difference:{" "}
+                  {difference == null
+                    ? <span className="pill bg-ink-100 text-ink-600">—</span>
+                    : difference > 0
+                      ? <span className="pill-warn">Surplus +{difference}</span>
+                      : difference < 0
+                        ? <span className="pill-bad">Shortage {difference}</span>
+                        : <span className="pill-good">Match</span>}
+                </p>
                 <label className="block">Reason for discrepancy
                   <input className="input mt-1" maxLength={500} disabled={audit.status !== "draft" || review || approval.pending}
                     value={source.reason || ""} onChange={(event) => updateSource(i, j, "reason", event.target.value)} />

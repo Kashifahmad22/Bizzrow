@@ -1,13 +1,14 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import toast from "react-hot-toast";
-import { Plus, Search, Edit2, Trash2, Package, Image as ImageIcon, Sparkles, Upload, ScanLine, PencilLine, Check, X, Download, Copy } from "lucide-react";
+import { Plus, Search, Edit2, Trash2, Package, Image as ImageIcon, Sparkles, Upload, ScanLine, PencilLine, Check, X, Download, Copy, RefreshCw } from "lucide-react";
 import { api } from "../api/client.js";
 import { useFinancialMutation } from "../hooks/useFinancialMutation.js";
 import { useDebounce } from "../hooks/useDebounce.js";
 import { duplicatePairKey, normalizeDuplicateGroups } from "../lib/duplicateReview.js";
 import { formatINR } from "../lib/format.js";
 import { defaultRetailPrice, gstBreakdown } from "../lib/pricing.js";
+import { invalidateProductCache } from "../lib/productCache.js";
 import { createLatestRequest } from "../lib/latestRequest.js";
 import PageHeader from "../components/PageHeader.jsx";
 import Modal from "../components/Modal.jsx";
@@ -96,11 +97,20 @@ export default function Products() {
     if (!confirm(`Delete "${p.name}"? This cannot be undone.`)) return;
     try {
       await api.delete(`/products/${p._id}`);
+      invalidateProductCache();
       toast.success("Product deleted");
       load();
     } catch (err) {
       toast.error(err.message);
     }
+  };
+
+  // Manual refresh: drop the shared product cache and refetch the current
+  // query/filters from the backend without touching the search input.
+  const refreshList = () => {
+    if (loading || loadingMore) return;
+    invalidateProductCache();
+    load(1, false);
   };
 
   const exportProducts = async () => {
@@ -155,6 +165,16 @@ export default function Products() {
             setQ(e.target.value);
           }}
         />
+        <button
+          type="button"
+          title="Refresh products"
+          aria-label="Refresh products"
+          className="p-1.5 rounded-lg text-ink-500 hover:text-brand-600 hover:bg-ink-50 disabled:opacity-50 shrink-0"
+          disabled={loading || loadingMore}
+          onClick={refreshList}
+        >
+          <RefreshCw className={`w-4 h-4 ${loading ? "animate-spin" : ""}`} />
+        </button>
       </div>
 
       {/* Inventory controls */}
@@ -267,7 +287,7 @@ export default function Products() {
       {duplicateReview && (
         <DuplicateReviewModal
           onClose={() => setDuplicateReview(false)}
-          onDeleted={() => load()}
+          onDeleted={() => { invalidateProductCache(); load(); }}
         />
       )}
       {batchProduct && (
@@ -463,6 +483,7 @@ function BatchDetailsModal({ product, onClose, onSaved }) {
         costPrice: form.costPrice === "" ? null : Number(form.costPrice),
       });
       toast.success(`Purchase batch ${data.batch.batchCode} added to stock`);
+      invalidateProductCache();
       setForm((current) => ({ ...current, batchCode: newBatchCode(), quantityReceived: "", costPrice: "", supplierName: "", purchaseReference: "", notes: "" }));
       await loadDetails();
       onSaved();
@@ -481,6 +502,7 @@ function BatchDetailsModal({ product, onClose, onSaved }) {
         reason: adjustmentForm.reason,
       });
       toast.success("Stock adjustment recorded");
+      invalidateProductCache();
       setAdjustmentForm({ batchId: "", delta: "", reason: "" });
       await loadDetails();
       onSaved();
@@ -669,17 +691,17 @@ function ProductCard({ product, onEdit, onDelete, onBatches }) {
             {product.stock === 0 ? "Out of stock" : `Low: ${product.stock} left`}
           </span>
         )}
-        <div className="absolute top-2 right-2 flex gap-1 opacity-0 group-hover:opacity-100 transition">
+        <div className="absolute top-2 right-2 flex gap-1 opacity-100 lg:opacity-0 lg:group-hover:opacity-100 transition">
           <button
             onClick={onEdit}
-            className="w-7 h-7 rounded-lg bg-surface/95 hover:bg-surface text-ink-700 flex items-center justify-center shadow"
+            className="w-8 h-8 lg:w-7 lg:h-7 rounded-lg bg-surface/95 hover:bg-surface text-ink-700 flex items-center justify-center shadow"
             title="Edit"
           >
             <Edit2 className="w-3.5 h-3.5" />
           </button>
           <button
             onClick={onDelete}
-            className="w-7 h-7 rounded-lg bg-surface/95 hover:bg-surface text-rose-500 flex items-center justify-center shadow"
+            className="w-8 h-8 lg:w-7 lg:h-7 rounded-lg bg-surface/95 hover:bg-surface text-rose-500 flex items-center justify-center shadow"
             title="Delete"
           >
             <Trash2 className="w-3.5 h-3.5" />
@@ -689,7 +711,7 @@ function ProductCard({ product, onEdit, onDelete, onBatches }) {
       <div className="p-3">
         <div className="font-semibold text-sm text-ink-800 truncate">{product.name}</div>
         <div className="text-xs text-ink-500 mt-0.5 truncate">
-          {[product.color, product.size].filter(Boolean).join(" · ") || product.category}
+          {[product.sku, product.color, product.size].filter(Boolean).join(" · ") || product.category}
         </div>
         <div className="flex items-end justify-between mt-2">
           <div>
@@ -755,6 +777,7 @@ function ProductModal({ editing, setEditing, onSaved }) {
         await api.post("/products", payload);
         toast.success("Product added");
       }
+      invalidateProductCache();
       onSaved();
       setEditing(null);
     } catch (err) {
@@ -1073,6 +1096,7 @@ function ImportModal({ onClose, onSaved }) {
       }));
       const { data } = await api.post("/products/import/commit", { products });
       toast.success(`Created ${data.created} product${data.created === 1 ? "" : "s"}`);
+      invalidateProductCache();
       onSaved();
       onClose();
     } catch (err) {
