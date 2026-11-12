@@ -75,12 +75,14 @@ test("Tatkal product creation is owner-scoped, idempotent and usable in a transa
     tatkal: true,
     name: "Tatkal Synthetic Product",
     quantity: 5,
-    sellingPrice: 20,
+    wholesalePrice: 20,
   };
   assert.equal((await request("/products", { method: "POST", body, token: null })).status, 401);
   assert.equal((await request("/products", { method: "POST", body: { ...body, owner: String(otherOwner._id) } })).status, 400);
   assert.equal((await request("/products", { method: "POST", body: { ...body, quantity: { value: 5 } } })).status, 400);
   assert.equal((await request("/products", { method: "POST", body: { ...body, costPrice: 4 } })).status, 400);
+  assert.equal((await request("/products", { method: "POST", body: { ...body, gstPct: 150 }, key: crypto.randomUUID() })).status, 400);
+  assert.equal((await request("/products", { method: "POST", body: { ...body, retailPrice: -1 }, key: crypto.randomUUID() })).status, 400);
   assert.equal((await request("/products", { method: "POST", body })).status, 400);
   assert.equal(await Product.countDocuments(), 0);
 
@@ -91,7 +93,9 @@ test("Tatkal product creation is owner-scoped, idempotent and usable in a transa
   assert.equal(product.name, body.name);
   assert.equal(product.stock, 5);
   assert.equal(product.wholesalePrice, 20);
-  assert.equal(product.retailPrice, 20);
+  assert.equal(product.retailPrice, 40);
+  assert.equal(product.retailPriceOverridden, false);
+  assert.equal(product.gstPct, 0);
   assert.equal(product.costPrice, null);
   assert.equal(product.marginPct, null);
 
@@ -148,4 +152,64 @@ test("Tatkal product creation is owner-scoped, idempotent and usable in a transa
   assert.ok(invalidSale.status >= 400);
   assert.deepEqual(await Product.findById(product._id).lean(), beforeFailedSale);
   assert.equal(await Sale.countDocuments({ owner: owner._id }), 1);
+
+  // Manual retail override + GST selection, used immediately in a retail sale.
+  const overrideCreate = await request("/products", {
+    method: "POST",
+    body: { tatkal: true, name: "Tatkal Override Product", quantity: 3, wholesalePrice: 100, retailPrice: 180, gstPct: 18 },
+    key: crypto.randomUUID(),
+  });
+  assert.equal(overrideCreate.status, 201, overrideCreate.data.message);
+  const overrideProduct = overrideCreate.data.product;
+  assert.equal(overrideProduct.wholesalePrice, 100);
+  assert.equal(overrideProduct.retailPrice, 180);
+  assert.equal(overrideProduct.retailPriceOverridden, true);
+  assert.equal(overrideProduct.gstPct, 18);
+
+  const retailSale = await request("/sales", {
+    method: "POST",
+    body: {
+      customerType: "walkin",
+      saleType: "retail",
+      items: [{ productId: overrideProduct._id, quantity: 1 }],
+      expectedTotal: 180,
+      payments: [{ method: "cash", amount: 180 }],
+    },
+    key: crypto.randomUUID(),
+  });
+  assert.equal(retailSale.status, 201, retailSale.data.message);
+  assert.equal(retailSale.data.sale.items[0].unitPrice, 180);
+  assert.equal(retailSale.data.sale.total, 180);
+  assert.equal((await Product.findById(overrideProduct._id)).stock, 2);
+
+  // Wholesale edits must not clobber the manual retail price; non-overridden
+  // products keep retail in sync at 2x wholesale.
+  const overrideEdit = await request(`/products/${overrideProduct._id}`, {
+    method: "PUT", body: { wholesalePrice: 120 },
+  });
+  assert.equal(overrideEdit.status, 200);
+  assert.equal(overrideEdit.data.product.wholesalePrice, 120);
+  assert.equal(overrideEdit.data.product.retailPrice, 180);
+  assert.equal(overrideEdit.data.product.retailPriceOverridden, true);
+
+  const autoEdit = await request(`/products/${product._id}`, {
+    method: "PUT", body: { wholesalePrice: 30 },
+  });
+  assert.equal(autoEdit.status, 200);
+  assert.equal(autoEdit.data.product.wholesalePrice, 30);
+  assert.equal(autoEdit.data.product.retailPrice, 60);
+  assert.equal(autoEdit.data.product.retailPriceOverridden, false);
+
+  // Restoring the 2x default clears the override.
+  const restore = await request(`/products/${overrideProduct._id}`, {
+    method: "PUT", body: { retailPrice: 240 },
+  });
+  assert.equal(restore.status, 200);
+  assert.equal(restore.data.product.retailPrice, 240);
+  assert.equal(restore.data.product.retailPriceOverridden, false);
+
+  // Historical retail sale snapshot is unchanged by the price edits.
+  const historicalRetailSale = await Sale.findById(retailSale.data.sale._id).lean();
+  assert.equal(historicalRetailSale.items[0].unitPrice, 180);
+  assert.equal(historicalRetailSale.total, 180);
 });

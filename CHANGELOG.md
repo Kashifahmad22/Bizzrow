@@ -1,5 +1,24 @@
 # Bizzrow — Changelog
 
+## v1.1 — Pricing Engine Standardization & Tatkal Product Addition
+
+### Official pricing rules (enforced server-side in `server/utils/productPricing.js`)
+- **Wholesale price** is the base selling price and is **GST-inclusive**. GST is never added on top at checkout; the component can be extracted for display as `inclusive × rate / (100 + rate)` (`gstBreakdown`, mirrored in `client/src/lib/pricing.js`).
+- **Retail price defaults to exactly 2× wholesale** (`defaultRetailPrice`) in every module — normal creation, Tatkal, OCR import, and legacy fallback.
+- **Manual retail overrides** are tracked with a new backward-compatible `Product.retailPriceOverridden` flag (`null` on legacy documents → resolved with a conservative heuristic so manually configured prices are never silently overwritten). Changing wholesale automatically keeps retail at 2× **only** when retail is not overridden; setting retail back to the 2× default restores automatic pricing.
+- Cost price stays independent of selling prices; unknown cost still reports no margin. Historical sale snapshots are unchanged by price edits (covered by integration tests).
+
+### Tatkal Product Addition
+- Form now captures **wholesale price (labelled GST-inclusive)**, an **auto-calculated editable retail price (2×)** with a manual indicator and a "Reset 2×" control, **opening stock**, and an optional **GST %**.
+- Backend accepts `wholesalePrice`/`retailPrice`/`gstPct` (legacy `sellingPrice` still works), validates GST % (0–100), and stores the override flag. Idempotent creation, tenant isolation, single stock deduction and transactional sale behavior are unchanged and re-verified.
+
+### Product forms
+- Wholesale field labelled **incl. GST** with a live GST breakdown line when the product has a GST rate.
+- Retail field shows **(2× auto)** or **(manual)** with a one-click reset to the default; editing wholesale now recalculates a non-overridden retail price (previously it went stale).
+
+### Tests
+- Server: 182/182 pass (including financial/Tatkal/inventory-audit integration tests on a disposable single-node replica set). Client: 23/23 unit tests pass, including new `pricing.test.js`. Playwright Tatkal e2e spec updated to the new form contract.
+
 ## Landing Page — Final Release (Conversion-Focused Launch)
 
 Premium, trust-first marketing site + unified auth, built to the standard of Stripe / Linear / Mercury. Not a redesign of the app — a launch release focused on conversion, professionalism and brand consistency.

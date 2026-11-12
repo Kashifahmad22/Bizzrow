@@ -7,6 +7,7 @@ import { useFinancialMutation } from "../hooks/useFinancialMutation.js";
 import { useDebounce } from "../hooks/useDebounce.js";
 import { duplicatePairKey, normalizeDuplicateGroups } from "../lib/duplicateReview.js";
 import { formatINR } from "../lib/format.js";
+import { defaultRetailPrice, gstBreakdown } from "../lib/pricing.js";
 import { createLatestRequest } from "../lib/latestRequest.js";
 import PageHeader from "../components/PageHeader.jsx";
 import Modal from "../components/Modal.jsx";
@@ -33,6 +34,7 @@ const EMPTY_FORM = {
   sellingPrice: "",
   wholesalePrice: "",
   retailPrice: "",
+  retailPriceOverridden: false,
   stock: "",
   image: "",
 };
@@ -232,7 +234,8 @@ export default function Products() {
                     costPrice: p.costPrice == null ? "" : String(p.costPrice),
                     sellingPrice: String(p.wholesalePrice ?? p.sellingPrice),
                     wholesalePrice: String(p.wholesalePrice ?? p.sellingPrice),
-                    retailPrice: String(p.retailPrice ?? (Number(p.sellingPrice) * 2)),
+                    retailPrice: String(p.retailPrice ?? defaultRetailPrice(p.wholesalePrice ?? p.sellingPrice)),
+                    retailPriceOverridden: !!p.retailPriceOverridden,
                     stock: String(p.stock),
                   })}
                   onDelete={() => onDelete(p)}
@@ -786,8 +789,8 @@ function ProductModal({ editing, setEditing, onSaved }) {
       sellingPrice: String(nextWholesale),
       wholesalePrice: String(nextWholesale),
     };
-    if (!editing.retailPrice || Number(editing.retailPrice) === round2(previousWholesale * 2)) {
-      updateData.retailPrice = String(round2(nextWholesale * 2));
+    if (!editing.retailPriceOverridden) {
+      updateData.retailPrice = String(defaultRetailPrice(nextWholesale));
     }
     update(updateData);
   };
@@ -798,13 +801,24 @@ function ProductModal({ editing, setEditing, onSaved }) {
       sellingPrice: v,
       wholesalePrice: v,
       marginPct: cost > 0 ? String(round2(((s - cost) / cost) * 100)) : editing.marginPct,
+      // Retail follows the 2x default until it is manually overridden.
+      ...(editing.retailPriceOverridden ? {} : { retailPrice: v === "" ? "" : String(defaultRetailPrice(v)) }),
     });
   };
+  const setRetail = (v) => update({
+    retailPrice: v,
+    retailPriceOverridden: Number(v) !== defaultRetailPrice(editing.wholesalePrice || editing.sellingPrice),
+  });
+  const restoreDefaultRetail = () => update({
+    retailPrice: String(defaultRetailPrice(editing.wholesalePrice || editing.sellingPrice)),
+    retailPriceOverridden: false,
+  });
 
   const wholesalePrice = Number(editing.wholesalePrice || editing.sellingPrice || 0);
-  const retailPrice = Number(editing.retailPrice || wholesalePrice * 2);
+  const retailPrice = Number(editing.retailPrice || defaultRetailPrice(wholesalePrice));
   const margin = wholesalePrice - Number(editing.costPrice || 0);
   const marginPct = wholesalePrice ? Math.round((margin / wholesalePrice) * 100) : 0;
+  const gst = gstBreakdown(wholesalePrice, editing.gstPct);
 
   return (
     <Modal
@@ -901,14 +915,24 @@ function ProductModal({ editing, setEditing, onSaved }) {
             <input className="input" type="number" step="0.01" placeholder="0" value={editing.marginPct} onChange={(e) => setMargin(e.target.value)} />
           </div>
           <div>
-            <label className="label">Wholesale ₹ *</label>
+            <label className="label">Wholesale ₹ * <span className="text-ink-400 font-normal">(incl. GST)</span></label>
             <input className="input" type="number" step="0.01" min="0" required value={editing.wholesalePrice || editing.sellingPrice} onChange={(e) => setSelling(e.target.value)} />
           </div>
           <div>
-            <label className="label">Retail ₹ *</label>
-            <input className="input" type="number" step="0.01" min="0" required value={editing.retailPrice} onChange={(e) => update({ retailPrice: e.target.value })} />
+            <label className="label flex items-center justify-between gap-1">
+              <span>Retail ₹ * {editing.retailPriceOverridden
+                ? <span className="text-amber-600 font-normal">(manual)</span>
+                : <span className="text-ink-400 font-normal">(2× auto)</span>}</span>
+              {editing.retailPriceOverridden && (
+                <button type="button" className="text-xs text-brand-600 underline font-normal" onClick={restoreDefaultRetail}>Reset 2×</button>
+              )}
+            </label>
+            <input className="input" type="number" step="0.01" min="0" required value={editing.retailPrice} onChange={(e) => setRetail(e.target.value)} />
           </div>
         </div>
+        {gst.gstAmount > 0 && (
+          <p className="text-[11px] text-ink-500 -mt-2">Wholesale includes {formatINR(gst.gstAmount)} GST at {gst.gstPct}% (taxable {formatINR(gst.taxableValue)}). GST is never added on top at checkout.</p>
+        )}
         <div className="grid grid-cols-2 gap-3">
           <div>
             <label className="label">{isEdit ? "Total stock" : "Opening stock"}</label>

@@ -10,7 +10,7 @@ const { buildTextFilter } = require("../utils/search");
 const ai = require("../services/aiService");
 const { normalizeExtraction } = require("../utils/ocrNormalize");
 const { clampLimit, clampPage, pageMeta } = require("../utils/validate");
-const { normalizeProductPrices, serializeProduct, validateCurrency } = require("../utils/productPricing");
+const { normalizeProductPrices, serializeProduct, validateCurrency, defaultRetailPrice } = require("../utils/productPricing");
 const { buildProductCsv, inventoryFilename } = require("../utils/productExport");
 const { detectProductDuplicates } = require("../utils/productDuplicates");
 const { deleteUnusedProduct, isValidProductId } = require("../services/productDeletion");
@@ -197,28 +197,55 @@ router.post(
   "/",
   asyncHandler(async (req, res) => {
     if (req.body?.tatkal === true) {
-      const allowedFields = new Set(["tatkal", "name", "sku", "quantity", "sellingPrice"]);
+      const allowedFields = new Set(["tatkal", "name", "sku", "quantity", "sellingPrice", "wholesalePrice", "retailPrice", "gstPct"]);
       if (!req.body || typeof req.body !== "object" || Array.isArray(req.body)
           || Object.keys(req.body).some((field) => !allowedFields.has(field))
           || typeof req.body.name !== "string" || !req.body.name.trim() || req.body.name.trim().length > 160
           || (req.body.sku !== undefined
             && (typeof req.body.sku !== "string" || req.body.sku.trim().length > 160))) {
-        throw Object.assign(new Error("Enter a product name, opening stock quantity, and selling price only"), { status: 400 });
+        throw Object.assign(new Error("Enter a product name, opening stock quantity, and wholesale price only"), { status: 400 });
       }
 
       const openingStock = validateNewQuantity(req.body.quantity);
-      const sellingPrice = validateCurrency(req.body.sellingPrice, "sellingPrice");
-      if (sellingPrice <= 0) {
-        throw Object.assign(new Error("Selling price must be greater than zero"), { status: 400 });
+      // Wholesale (GST-inclusive) is the base selling price; legacy clients may
+      // still send it as sellingPrice.
+      const wholesaleRaw = req.body.wholesalePrice ?? req.body.sellingPrice;
+      if (wholesaleRaw == null) {
+        throw Object.assign(new Error("Wholesale price is required"), { status: 400 });
+      }
+      const wholesale = validateCurrency(wholesaleRaw, "wholesalePrice");
+      if (wholesale <= 0) {
+        throw Object.assign(new Error("Wholesale price must be greater than zero"), { status: 400 });
+      }
+      let retail;
+      let retailOverridden;
+      if (req.body.retailPrice != null && req.body.retailPrice !== "") {
+        retail = validateCurrency(req.body.retailPrice, "retailPrice");
+        if (retail <= 0) {
+          throw Object.assign(new Error("Retail price must be greater than zero"), { status: 400 });
+        }
+        retailOverridden = retail !== defaultRetailPrice(wholesale);
+      } else {
+        retail = defaultRetailPrice(wholesale);
+        retailOverridden = false;
+      }
+      let gstPct = 0;
+      if (req.body.gstPct !== undefined && req.body.gstPct !== null && req.body.gstPct !== "") {
+        gstPct = Number(req.body.gstPct);
+        if (typeof req.body.gstPct === "object" || !Number.isFinite(gstPct) || gstPct < 0 || gstPct > 100) {
+          throw Object.assign(new Error("GST % must be a number between 0 and 100"), { status: 400 });
+        }
       }
       const key = requireIdempotencyKey(req);
       const payload = {
         owner: req.user._id,
         name: req.body.name.trim(),
         sku: (req.body.sku || "").trim(),
-        wholesalePrice: sellingPrice,
-        retailPrice: sellingPrice,
-        sellingPrice,
+        wholesalePrice: wholesale,
+        retailPrice: retail,
+        retailPriceOverridden: retailOverridden,
+        sellingPrice: wholesale,
+        gstPct,
         costPrice: null,
         marginPct: null,
         stock: openingStock,
